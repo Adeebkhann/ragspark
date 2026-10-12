@@ -247,7 +247,8 @@ class SmartParser:
 
         custom_matches = run_custom_regexes(full_clean_text, extra_patterns=custom_regexes)
 
-        return ParsedDocument(
+        global _LAST_PARSED_DOC
+        doc_obj = ParsedDocument(
             source=source,
             doc_type=doc_type,
             mode_used=effective_mode,
@@ -266,8 +267,13 @@ class SmartParser:
             custom_matches=custom_matches,
             metadata=doc_meta,
         )
+        _LAST_PARSED_DOC = doc_obj
+        return doc_obj
 
+
+_LAST_PARSED_DOC: ParsedDocument | None = None
 
 # Singleton instance backing `from raglib import parser`
 default_parser = SmartParser()
+
 

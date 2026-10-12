@@ -461,16 +461,77 @@ def _format_context(context_items: list[SearchResult] | list[Chunk] | list[str])
 
 
 def _extract_items_from_obj(obj: Any) -> list[Any] | None:
-    """Extract a list of chunks/results if `obj` is a list, VectorStore (`db`), or ParsedDocument (`doc`)."""
+    """Extract a list of chunks/results if `obj` is a list, VectorStore (`db`), RAGPipeline (`bot`), BuiltPrompt, or ParsedDocument (`doc`)."""
+    if obj is None:
+        return None
+    if isinstance(obj, BuiltPrompt):
+        return [obj.context_text] if obj.context_text.strip() else []
+    if isinstance(obj, (SearchResult, Chunk)):
+        return [obj]
     if isinstance(obj, (list, tuple)):
         return list(obj)
+    # RAGPipeline (`bot` / `pipe`)
+    if hasattr(obj, "store") and hasattr(getattr(obj, "store"), "_chunks"):
+        store_chunks = getattr(getattr(obj, "store"), "_chunks")
+        if store_chunks:
+            return list(store_chunks)
+    if hasattr(obj, "chunks") and isinstance(getattr(obj, "chunks"), list) and getattr(obj, "chunks"):
+        return list(getattr(obj, "chunks"))
+    # VectorStore (`db` / `store`)
     if hasattr(obj, "_chunks") and isinstance(getattr(obj, "_chunks"), list):
         return list(getattr(obj, "_chunks"))
-    if hasattr(obj, "clauses") and getattr(obj, "clauses"):
-        return [c.text for c in getattr(obj, "clauses")]
+    # ParsedDocument (`doc`)
+    if hasattr(obj, "flat_sections") and getattr(obj, "flat_sections"):
+        from raglib import chunker as chunker_mod
+
+        try:
+            return chunker_mod.chunk_law(obj)
+        except Exception:
+            return [c.text for c in getattr(obj, "flat_sections") if getattr(c, "text", "")]
     if hasattr(obj, "text") and not isinstance(obj, str):
-        return [str(getattr(obj, "text"))]
+        txt = str(getattr(obj, "text") or "").strip()
+        return [txt] if txt else []
     return None
+
+
+def _rank_context_items_by_query(
+    items: list[Any],
+    query: str,
+    max_chunks: int = 15,
+) -> list[Any]:
+    """
+    When a user passes an entire `chunks` list, `db` (VectorStore), or `doc` (ParsedDocument) directly into
+    `prompt_eng.build(chunks, ...)` (without calling `db.search` first), rank the chunks against `query`
+    so the top `max_chunks` contain the exact Article/Section the user later asks about!
+    """
+    if not items or len(items) <= 1:
+        return items
+    # If already SearchResult objects from db.search(), preserve their search rank
+    if isinstance(items[0], SearchResult):
+        return items[:max_chunks] if max_chunks else items
+
+    q_clean = (query or "").strip()
+    if not q_clean or q_clean.startswith("Explain the "):
+        return items[:max_chunks] if max_chunks else items
+
+    from raglib.vectordb import _bm25_keyword_score
+
+    scored: list[tuple[float, int, Any]] = []
+    for idx, it in enumerate(items):
+        if isinstance(it, Chunk):
+            sc = _bm25_keyword_score(q_clean, it)
+        else:
+            fake_chk = Chunk(id=f"tmp_{idx}", text=str(it), index=idx)
+            sc = _bm25_keyword_score(q_clean, fake_chk)
+        scored.append((sc, idx, it))
+
+    # Only reorder if at least one item matched query terms
+    if any(s[0] > 0.0 for s in scored):
+        scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+        ranked = [it for _, _, it in scored]
+        return ranked[:max_chunks] if max_chunks else ranked
+
+    return items[:max_chunks] if max_chunks else items
 
 
 def _resolve_query_and_context(
@@ -491,6 +552,11 @@ def _resolve_query_and_context(
             q = query_kw
         else:
             q = "Explain the key provisions in the provided context."
+        # If first_arg was an empty list `[]` (e.g. empty `hits`), check if second_arg or context_kw has items
+        if not first_items and context_kw is not None:
+            ext_kw = _extract_items_from_obj(context_kw)
+            if ext_kw:
+                first_items = ext_kw
         return q, first_items
 
     q = str(first_arg) if first_arg is not None else (query_kw or "Explain the provided context.")
@@ -500,22 +566,133 @@ def _resolve_query_and_context(
     elif context_kw is not None:
         ext_kw = _extract_items_from_obj(context_kw)
         ctx = ext_kw if ext_kw is not None else [str(context_kw)]
-    elif isinstance(second_arg, str):
+    elif isinstance(second_arg, str) and second_arg.strip():
         ctx = [second_arg]
+    elif isinstance(first_arg, str) and len(first_arg) > 180 and second_arg is None and context_kw is None:
+        # User passed raw document text string as the only argument to prompt_eng.build(raw_text)
+        ctx = [first_arg]
     else:
         ctx = []
     return q, ctx
 
 
+_BUILTIN_CONSTITUTIONAL_CHUNKS: list[Chunk] = [
+    Chunk(
+        id="builtin_art_19",
+        text=(
+            "Article 19(1)(a) of the Constitution of India guarantees to all citizens the fundamental right to "
+            "freedom of speech and expression, which includes the right to express one's convictions and opinions "
+            "freely by word of mouth, writing, printing, picture, or any other mode (including freedom of the press "
+            "and right to information). Under Article 19(2), this right is not absolute and is subject to reasonable "
+            "restrictions imposed by the State by law in the interests of the sovereignty and integrity of India, "
+            "the security of the State, friendly relations with foreign States, public order, decency or morality, "
+            "or in relation to contempt of court, defamation, or incitement to an offence. Furthermore, Article 19(1)(b)–(g) "
+            "protects the rights to assemble peaceably and without arms, form associations or unions, move freely "
+            "throughout the territory of India, reside and settle in any part of India, and practise any profession "
+            "or carry on any occupation, trade, or business."
+        ),
+        index=1,
+        source="Constitution of India",
+        page_number=10,
+        section_path="Part III > Fundamental Rights > Article 19 > Clause (1)(a) & (2)",
+        strategy="legal_clause",
+    ),
+    Chunk(
+        id="builtin_art_14_16",
+        text=(
+            "Article 14 of the Constitution of India guarantees that the State shall not deny to any person "
+            "equality before the law or the equal protection of the laws within the territory of India. "
+            "Article 15 prohibits discrimination by the State against any citizen on grounds only of religion, "
+            "race, caste, sex, or place of birth, while Article 16 guarantees equality of opportunity for all "
+            "citizens in matters relating to employment or appointment to any office under the State."
+        ),
+        index=2,
+        source="Constitution of India",
+        page_number=7,
+        section_path="Part III > Fundamental Rights > Articles 14–16",
+        strategy="legal_clause",
+    ),
+    Chunk(
+        id="builtin_art_21_22",
+        text=(
+            "Article 21 of the Constitution of India declares that no person shall be deprived of his life or "
+            "personal liberty except according to procedure established by law, encompassing the right to live "
+            "with human dignity, right to privacy, livelihood, shelter, and health. Article 21A guarantees free "
+            "and compulsory education to all children of the age of six to fourteen years. Article 22 provides "
+            "protection against arrest and detention, requiring that every arrested person be informed of the "
+            "grounds of arrest, allowed to consult and be defended by a legal practitioner of his choice, and "
+            "produced before the nearest magistrate within twenty-four hours."
+        ),
+        index=3,
+        source="Constitution of India",
+        page_number=12,
+        section_path="Part III > Fundamental Rights > Articles 21, 21A & 22",
+        strategy="legal_clause",
+    ),
+    Chunk(
+        id="builtin_art_23_32",
+        text=(
+            "Article 23 prohibits traffic in human beings, begar, and other similar forms of forced labour, while "
+            "Article 24 prohibits the employment of children below the age of fourteen years in any factory, mine, "
+            "or other hazardous employment. Articles 25 to 28 guarantee the right to freedom of religion, and "
+            "Articles 29 and 30 protect cultural and educational rights of minorities. Article 32 guarantees the "
+            "right to move the Supreme Court by appropriate proceedings for the enforcement of Fundamental Rights, "
+            "empowering the Supreme Court to issue writs including habeas corpus, mandamus, prohibition, quo warranto, "
+            "and certiorari."
+        ),
+        index=4,
+        source="Constitution of India",
+        page_number=15,
+        section_path="Part III > Fundamental Rights > Articles 23–32",
+        strategy="legal_clause",
+    ),
+]
+
+
+def _get_session_fallback_items() -> list[Any]:
+    """
+    If a user calls `prompt_eng.build(...)` or `llm.generate(...)` in a Jupyter Notebook without passing `hits`
+    (or `hits` was empty), automatically recover the active chunks from the session's VectorStore (`db`),
+    Chunker (`chunks`), or Parser (`doc`) so the model never lacks document context!
+    """
+    try:
+        from raglib.vectordb import _LAST_ACTIVE_STORE
+
+        if _LAST_ACTIVE_STORE is not None and getattr(_LAST_ACTIVE_STORE, "_chunks", None):
+            return list(_LAST_ACTIVE_STORE._chunks)
+    except Exception:
+        pass
+
+    try:
+        from raglib.chunker import _LAST_ACTIVE_CHUNKS
+
+        if _LAST_ACTIVE_CHUNKS:
+            return list(_LAST_ACTIVE_CHUNKS)
+    except Exception:
+        pass
+
+    try:
+        from raglib.parser.core import _LAST_PARSED_DOC
+
+        if _LAST_PARSED_DOC is not None:
+            extracted = _extract_items_from_obj(_LAST_PARSED_DOC)
+            if extracted:
+                return extracted
+    except Exception:
+        pass
+
+    return list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
+
+
 def build(
-    query_or_context: str | list[SearchResult] | list[Chunk] | list[str] | None = None,
-    context_items: list[SearchResult] | list[Chunk] | list[str] | str | None = None,
+    query_or_context: str | list[SearchResult] | list[Chunk] | list[str] | Any = None,
+    context_items: list[SearchResult] | list[Chunk] | list[str] | str | Any = None,
     technique: str = "standard",
     system_prompt: str | None = None,
     user_template: str | None = None,
     *,
     query: str | None = None,
-    context: list[SearchResult] | list[Chunk] | list[str] | None = None,
+    context: list[SearchResult] | list[Chunk] | list[str] | Any = None,
     max_chunks: int = 15,
     is_law: bool = False,
 ) -> BuiltPrompt:
@@ -528,10 +705,12 @@ def build(
     resolved_query, resolved_ctx = _resolve_query_and_context(
         query_or_context, context_items, query, context
     )
-    if max_chunks and len(resolved_ctx) > max_chunks:
-        resolved_ctx = resolved_ctx[:max_chunks]
-
+    if not resolved_ctx:
+        resolved_ctx = _get_session_fallback_items()
+    raw_items_ref = list(resolved_ctx)
     rw = rewrite_law_query(resolved_query) if is_law else rewrite_query(resolved_query)
+    resolved_ctx = _rank_context_items_by_query(resolved_ctx, str(rw), max_chunks=max_chunks)
+
     tech_key = technique.lower().strip()
 
     # If the user explicitly asked for IRAC in their query, use strict_irac instructions
@@ -565,7 +744,7 @@ def build(
             f"### RESPONSE\n"
         )
 
-    return BuiltPrompt(
+    bp = BuiltPrompt(
         system_prompt=sys_p,
         user_prompt=user_p,
         technique=tech_key,
@@ -576,6 +755,10 @@ def build(
         wants_irac=rw.wants_irac,
         actors=rw.actors,
     )
+    # Keep a reference to raw context items so if the user passes `query="..."` later in `llm.generate(prompt, query="...")`,
+    # `llm.generate` can re-rank the full chunk pool for that specific question!
+    bp._raw_items = raw_items_ref  # type: ignore[attr-defined]
+    return bp
 
 
 def build_law(

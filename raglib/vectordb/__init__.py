@@ -150,6 +150,9 @@ def _cross_feature_rerank_score(query_text: str, chunk: Chunk, base_score: float
     return min(1.0, (base_score * 0.75) + bonus)
 
 
+_LAST_ACTIVE_STORE: VectorStore | None = None
+
+
 class VectorStore:
     """Unified VectorDB interface supporting ChromaDB (default), Pinecone, MongoDB, Qdrant, and Memory."""
 
@@ -168,6 +171,7 @@ class VectorStore:
         embed_dimension: int = 384,
         **kwargs: Any,
     ) -> None:
+        global _LAST_ACTIVE_STORE
         raw_prov = backend or provider
         self.provider = raw_prov.lower().strip()
         if self.provider in ("chromadb", "chroma_db"):
@@ -192,6 +196,7 @@ class VectorStore:
         self._backend_name = self.provider
 
         self._init_backend()
+        _LAST_ACTIVE_STORE = self
 
     def _init_backend(self) -> None:
         if self.provider == "chroma":
@@ -271,6 +276,8 @@ class VectorStore:
 
     def add(self, chunks: list[Chunk], embeddings: list[list[float]] | None = None) -> int:
         """Insert or update chunks and their embeddings in the chosen VectorDB (auto-embeds if `embeddings` is omitted)."""
+        global _LAST_ACTIVE_STORE
+        _LAST_ACTIVE_STORE = self
         if not chunks:
             return 0
         if embeddings is None:

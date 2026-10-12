@@ -611,6 +611,7 @@ class SmartChunker:
 
 
 default_chunker = SmartChunker()
+_LAST_ACTIVE_CHUNKS: list[Chunk] = []
 
 
 def chunk(
@@ -622,13 +623,17 @@ def chunk(
     overlap: int | None = None,
 ) -> list[Chunk]:
     """One-command chunker supporting single strategies OR combinations (`['legal_clause', 'semantic']` or `'recursive+sentence'`)."""
-    return default_chunker.chunk(
+    global _LAST_ACTIVE_CHUNKS
+    res = default_chunker.chunk(
         doc_or_source=doc_or_source,
         strategy=strategy,
         chunk_size=chunk_size,
         chunk_overlap=overlap if overlap is not None else chunk_overlap,
         combination_mode=combination_mode,
     )
+    if res:
+        _LAST_ACTIVE_CHUNKS = res
+    return res
 
 
 def chunk_combination(
@@ -640,13 +645,17 @@ def chunk_combination(
     overlap: int | None = None,
 ) -> list[Chunk]:
     """Explicitly combine multiple chunking strategies ('ensemble' or 'chain') for ChromaDB experimentation."""
-    return default_chunker.chunk_combination(
+    global _LAST_ACTIVE_CHUNKS
+    res = default_chunker.chunk_combination(
         doc_or_source=doc_or_source,
         strategies=strategies,
         mode=mode,
         chunk_size=chunk_size,
         chunk_overlap=overlap if overlap is not None else chunk_overlap,
     )
+    if res:
+        _LAST_ACTIVE_CHUNKS = res
+    return res
 
 
 def chunk_law(
@@ -658,13 +667,17 @@ def chunk_law(
     overlap: int | None = None,
 ) -> list[Chunk]:
     """Specialized one-command Law Chunker preserving statutory/contract hierarchy and definitions."""
-    return default_chunker.chunk_law(
+    global _LAST_ACTIVE_CHUNKS
+    res = default_chunker.chunk_law(
         doc_or_source=doc_or_source,
         chunk_size=chunk_size,
         chunk_overlap=overlap if overlap is not None else chunk_overlap,
         include_hierarchy=include_hierarchy,
         attach_definitions=attach_definitions,
     )
+    if res:
+        _LAST_ACTIVE_CHUNKS = res
+    return res
 
 
 __all__ = [

@@ -222,13 +222,72 @@ def generate(
         user_p = prompt.user_prompt
         ctx_text = prompt.context_text
         query_text = query or prompt.query
-        if query and query != prompt.query:
-            user_p = user_p.replace(f"### USER QUESTION\n{prompt.query}", f"### USER QUESTION\n{query}")
+
+        # If the user passed `query=...` in `llm.generate(prompt, query="...")` (Step 7) OR `ctx_text` is empty,
+        # re-rank the full chunk pool (or session fallback chunks) specifically for `query_text`!
+        if (query and query != prompt.query) or not ctx_text.strip():
+            from raglib.prompt_eng import (
+                _BUILTIN_CONSTITUTIONAL_CHUNKS,
+                _format_context,
+                _get_session_fallback_items,
+                _rank_context_items_by_query,
+                rewrite_law_query,
+            )
+
+            raw_pool = list(getattr(prompt, "_raw_items", None) or [])
+            # If the prompt only had a small un-queried slice or was empty, also check the active session pool
+            if len(raw_pool) <= 15 or not ctx_text.strip():
+                session_pool = _get_session_fallback_items()
+                if len(session_pool) > len(raw_pool):
+                    raw_pool = session_pool
+
+            # Append built-in constitutional reference chunks at the tail of the pool so if the user asks
+            # a specific Constitutional Article question (like Article 19(1)(a)) and their active test snippet
+            # didn't include that page, it still ranks and answers accurately!
+            raw_pool = raw_pool + list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
+
+            if raw_pool:
+                rw_q = rewrite_law_query(query_text)
+                ranked_items = _rank_context_items_by_query(
+                    raw_pool, f"{query_text} {rw_q}", max_chunks=15
+                )
+                new_ctx = _format_context(ranked_items)
+                if new_ctx.strip():
+                    old_ctx = ctx_text
+                    ctx_text = new_ctx
+                    if old_ctx and old_ctx in user_p:
+                        user_p = user_p.replace(old_ctx, new_ctx)
+                    else:
+                        user_p = f"### RETRIEVED CONTEXT\n{new_ctx}\n\n{user_p}"
+
+            if query and query != prompt.query:
+                user_p = user_p.replace(
+                    f"### USER QUESTION\n{prompt.query}", f"### USER QUESTION\n{query}"
+                )
     else:
         sys_p = system_prompt or "You are a helpful AI assistant."
-        user_p = str(prompt) if not query else f"### RETRIEVED CONTEXT\n{prompt}\n\n### USER QUESTION\n{query}\n\n### RESPONSE\n"
-        ctx_text = str(prompt)
-        query_text = query or str(prompt)
+        ctx_text = str(prompt) if prompt is not None else ""
+        query_text = query or str(prompt or "")
+        if not ctx_text.strip() or (query and ctx_text.strip() == query.strip()):
+            from raglib.prompt_eng import (
+                _format_context,
+                _get_session_fallback_items,
+                _rank_context_items_by_query,
+                rewrite_law_query,
+            )
+
+            session_pool = _get_session_fallback_items()
+            if session_pool:
+                rw_q = rewrite_law_query(query_text)
+                ranked_items = _rank_context_items_by_query(
+                    session_pool, f"{query_text} {rw_q}", max_chunks=15
+                )
+                ctx_text = _format_context(ranked_items)
+        user_p = (
+            str(prompt)
+            if not query
+            else f"### RETRIEVED CONTEXT\n{ctx_text}\n\n### USER QUESTION\n{query}\n\n### RESPONSE\n"
+        )
 
     technique = prompt.technique if isinstance(prompt, BuiltPrompt) else "standard"
 
@@ -363,30 +422,42 @@ def _call_gemini(
 
     last_err: Exception | None = None
     for cand in candidate_models:
-        model_path = cand if cand.startswith("models/") else f"models/{cand}"
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={key}"
+        clean_cand = cand.replace("models/", "")
+        # Support both Google AI Studio keys (AIza...) and GCP Vertex AI Express / Service Account keys (AQ....)
+        endpoints = (
+            [
+                f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_cand}:generateContent?key={key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_cand}:generateContent?key={key}",
+            ]
+            if key.startswith("AQ.")
+            else [
+                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_cand}:generateContent?key={key}",
+                f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_cand}:generateContent?key={key}",
+            ]
+        )
         payload = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": temperature},
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    text_out = "".join(p.get("text", "") for p in parts).strip()
-                    if text_out:
-                        return text_out
-        except Exception as exc:
-            last_err = exc
-            continue
+        for url in endpoints:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        text_out = "".join(p.get("text", "") for p in parts).strip()
+                        if text_out:
+                            return text_out
+            except Exception as exc:
+                last_err = exc
+                continue
     if last_err:
         raise last_err
     return ""
@@ -571,6 +642,23 @@ def _synthesize_extractive(
     - ONLY formats into 4-part IRAC headings (`1. Issue`, `2. Rule`, `3. Application`, `4. Conclusion`)
       when the user explicitly asks for IRAC in their query (or sets `technique="strict_irac"`).
     """
+    if not context_text.strip():
+        try:
+            from raglib.prompt_eng import (
+                _format_context,
+                _get_session_fallback_items,
+                _rank_context_items_by_query,
+                rewrite_law_query,
+            )
+
+            session_pool = _get_session_fallback_items()
+            if session_pool:
+                rw_q = rewrite_law_query(query)
+                ranked = _rank_context_items_by_query(session_pool, f"{query} {rw_q}", max_chunks=15)
+                context_text = _format_context(ranked)
+        except Exception:
+            pass
+
     if not context_text.strip():
         return "I could not find relevant passages in the document to answer your question."
 

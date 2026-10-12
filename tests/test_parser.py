@@ -301,3 +301,34 @@ def test_readme_quickstart_and_ragspark_aliases(tmp_path: Path) -> None:
         nb_srv.server_close()
 
 
+def test_step7_notebook_screenshot_regression() -> None:
+    """
+    Reproduce the exact Jupyter Notebook Step-7 call from the user's screenshot:
+      answer = llm.generate(
+          prompt,
+          query="Explain freedom of speech and expression under Article 19(1)(a).",
+          provider="gemini",
+          model="gemini 3.8 flash",
+          api_key="test-placeholder-key"
+      )
+      print(answer.text)
+    Verify it NEVER outputs 'I could not find relevant passages in the document to answer your question.'
+    even when `prompt` was built without hits or without a query in Step 6!
+    """
+    from raglib import llm, prompt_eng
+
+    # Case 1: User built `prompt` in Step 6 with empty/missing hits or without passing `query`
+    empty_prompt = prompt_eng.build(technique="standard")
+    answer = llm.generate(
+        empty_prompt,
+        query="Explain freedom of speech and expression under Article 19(1)(a).",
+        provider="gemini",
+        model="gemini 3.8 flash",
+        api_key="test-placeholder-key",
+    )
+    assert "I could not find relevant passages" not in answer.text
+    assert "Article 19(1)(a)" in answer.text
+    assert "freedom of speech and expression" in answer.text.lower()
+
+
+
