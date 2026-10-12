@@ -1,0 +1,579 @@
+"""
+`raglib.rag` — Production General & Specialized Law RAG Pipeline Engine + Experimentation Suite.
+
+Supports:
+  - Single or Combined Chunking Strategies (`chunk_strategy="recursive"` or `["legal_clause", "semantic"]`)
+  - Selectable Embedding Provider (`embed_provider`) + Embedding Strategy (`embed_strategy="legal_domain_boost"`)
+  - Selectable Retrieval Technique (`retrieval_strategy="hybrid"`, `"semantic"`, `"bm25"`, `"rrf"`, `"mmr"`, `"rerank"`, `"multi_query"`)
+  - Selectable VectorDB (`vectordb="chroma"` default, `"pinecone"`, `"mongodb"`, `"qdrant"`, `"memory"`)
+  - Selectable Prompt Engineering Technique + Custom `system_prompt`
+  - Selectable LLM Runtime (`"gemini 3.8 flash"`, `"claude sonnet 5.5"`, `"gpt 4o"`, `"llama 3.2"`, `"extractive"`)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from raglib import chunker as chunker_mod
+from raglib import embedder as embedder_mod
+from raglib import llm as llm_mod
+from raglib import parser as parser_mod
+from raglib import prompt_eng as prompt_mod
+from raglib import vectordb as vectordb_mod
+from raglib.chunker import Chunk
+from raglib.parser import ParsedDocument
+from raglib.prompt_eng import BuiltPrompt
+from raglib.vectordb import SearchResult, VectorStore
+
+
+@dataclass
+class RAGResponse:
+    """Complete result from `pipe.ask(...)`, `rag.ask(...)`, or `rag.ask_law(...)`."""
+
+    query: str
+    answer: str
+    sources: list[SearchResult]
+    built_prompt: BuiltPrompt
+    mode: str = "general"
+    llm_provider: str = "extractive"
+    vectordb_provider: str = "chroma"
+    retrieval_strategy: str = "hybrid"
+    rewritten_query: str = ""
+    is_story: bool = False
+    wants_irac: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def text(self) -> str:
+        """Alias for `answer` so both `resp.answer` and `resp.text` work."""
+        return self.answer
+
+    def __str__(self) -> str:
+        return self.answer
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "rewritten_query": self.rewritten_query,
+            "is_story": self.is_story,
+            "wants_irac": self.wants_irac,
+            "answer": self.answer,
+            "mode": self.mode,
+            "llm_provider": self.llm_provider,
+            "vectordb_provider": self.vectordb_provider,
+            "retrieval_strategy": self.retrieval_strategy,
+            "sources": [s.to_dict() for s in self.sources],
+            "prompt": self.built_prompt.to_dict(),
+            "metadata": self.metadata,
+        }
+
+
+class RAGPipeline:
+    """
+    Stateful, reusable Production RAG Pipeline created via `rag.create(...)` or `rag.create_law(...)`.
+    """
+
+    def __init__(
+        self,
+        document: ParsedDocument,
+        chunks: list[Chunk],
+        store: VectorStore,
+        mode: str = "general",
+        embed_provider: str = "fast_local",
+        embed_strategy: str = "dense",
+        embed_model: str | None = None,
+        embed_api_key: str | None = None,
+        embed_dimension: int = 384,
+        retrieval_strategy: str = "hybrid",
+        llm_provider: str = "extractive",
+        llm_model: str | None = None,
+        llm_api_key: str | None = None,
+        llm_base_url: str | None = None,
+        prompt_technique: str = "standard",
+        system_prompt: str | None = None,
+        rewrite_queries: bool = True,
+    ) -> None:
+        self.document = document
+        self.chunks = chunks
+        self.store = store
+        self.mode = mode
+        self.embed_provider = embed_provider
+        self.embed_strategy = embed_strategy
+        self.embed_model = embed_model
+        self.embed_api_key = embed_api_key
+        self.embed_dimension = embed_dimension
+        self.retrieval_strategy = retrieval_strategy
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self.llm_api_key = llm_api_key
+        self.llm_base_url = llm_base_url
+        self.prompt_technique = prompt_technique
+        self.system_prompt = system_prompt
+        self.rewrite_queries = rewrite_queries
+
+    def rewrite_query(self, query: str) -> prompt_mod.QueryRewriteResult:
+        """Rewrite a query using Law Query Rewriting (if mode=='law') or General Query Rewriting."""
+        if self.mode == "law":
+            return prompt_mod.rewrite_law_query(query)
+        return prompt_mod.rewrite_query(query)
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        retrieval_strategy: str | None = None,
+        chunk_strategy_filter: str | list[str] | None = None,
+        rewrite: bool | None = None,
+    ) -> list[SearchResult]:
+        """
+        Retrieve top_k chunks using the selected retrieval strategy ('hybrid', 'semantic', 'bm25', 'rrf', 'mmr', 'rerank', 'multi_query').
+        Automatically applies Query Rewriting (including Legal Story-to-Article mapping in law mode) when `rewrite=True`.
+        """
+        use_rewrite = self.rewrite_queries if rewrite is None else rewrite
+        search_query = str(self.rewrite_query(query)) if use_rewrite else query
+
+        q_vec = embedder_mod.embed_query(
+            search_query,
+            provider=self.embed_provider,
+            strategy=self.embed_strategy,
+            model=self.embed_model,
+            api_key=self.embed_api_key,
+            dimension=self.embed_dimension,
+        )
+        ret_strat = retrieval_strategy or self.retrieval_strategy
+        return self.store.search(
+            query_embedding=q_vec,
+            query_text=search_query,
+            top_k=top_k,
+            strategy=ret_strat,
+            chunk_strategy_filter=chunk_strategy_filter,
+        )
+
+    def ask(
+        self,
+        query: str,
+        top_k: int = 5,
+        retrieval_strategy: str | None = None,
+        chunk_strategy_filter: str | list[str] | None = None,
+        prompt_technique: str | None = None,
+        technique: str | None = None,
+        prompt: str | None = None,
+        system_prompt: str | None = None,
+        user_template: str | None = None,
+        llm_provider: str | None = None,
+        provider: str | None = None,
+        llm_model: str | None = None,
+        model: str | None = None,
+        llm_api_key: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        rewrite: bool | None = None,
+    ) -> RAGResponse:
+        """
+        1. Automatically rewrites query (General or Specialized Legal Story/Article Rewriting)
+        2. Retrieves relevant chunks using the chosen retrieval strategy
+        3. Builds adaptive prompt (fluent natural sentences by default; switches to IRAC only if user asks for IRAC in query)
+        4. Generates grounded answer via the chosen LLM runtime
+        """
+        ret_strat = retrieval_strategy or self.retrieval_strategy
+        rw_info = self.rewrite_query(query)
+        hits = self.retrieve(
+            query,
+            top_k=top_k,
+            retrieval_strategy=ret_strat,
+            chunk_strategy_filter=chunk_strategy_filter,
+            rewrite=rewrite,
+        )
+        chosen_tech = prompt_technique or technique or prompt or self.prompt_technique
+        chosen_sys = system_prompt or self.system_prompt
+        chosen_model = llm_model or model or self.llm_model
+        explicit_prov = llm_provider or provider
+        raw_prov = explicit_prov or (
+            "auto" if (chosen_model and self.llm_provider == "extractive") else self.llm_provider
+        )
+        resolved_prov, resolved_model = llm_mod.resolve_model_and_provider(
+            provider=raw_prov,
+            model=chosen_model,
+        )
+        chosen_key = llm_api_key or api_key or self.llm_api_key
+        chosen_url = base_url or self.llm_base_url
+
+        if self.mode == "law":
+            built = prompt_mod.build_law(
+                query=query,
+                context_items=hits,
+                technique=chosen_tech or "natural_law",
+                system_prompt=chosen_sys,
+                user_template=user_template,
+            )
+        else:
+            built = prompt_mod.build(
+                query=query,
+                context_items=hits,
+                technique=chosen_tech or "standard",
+                system_prompt=chosen_sys,
+                user_template=user_template,
+            )
+
+        answer = llm_mod.generate(
+            prompt=built,
+            provider=resolved_prov,
+            model=resolved_model,
+            system_prompt=built.system_prompt,
+            api_key=chosen_key,
+            base_url=chosen_url,
+        )
+
+        return RAGResponse(
+            query=query,
+            answer=str(answer),
+            sources=hits,
+            built_prompt=built,
+            mode=self.mode,
+            llm_provider=f"{resolved_prov}:{resolved_model}",
+            vectordb_provider=self.store.provider,
+            retrieval_strategy=ret_strat,
+            rewritten_query=str(rw_info),
+            is_story=rw_info.is_story,
+            wants_irac=rw_info.wants_irac,
+            metadata={
+                "doc_type": self.document.doc_type,
+                "num_chunks_indexed": self.store.count(),
+                "indexed_chunk_strategies": self.store.list_indexed_strategies(),
+                "technique": built.technique,
+                "embed_strategy": self.embed_strategy,
+                "retrieval_strategy": ret_strat,
+                "resolved_model": resolved_model,
+                "rewritten_query": str(rw_info),
+                "is_story": rw_info.is_story,
+                "wants_irac": rw_info.wants_irac,
+                "detected_concepts": rw_info.detected_concepts,
+            },
+        )
+
+
+    def compare_retrieval(
+        self,
+        query: str,
+        strategies: list[str] | None = None,
+        top_k: int = 3,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Run an instant side-by-side retrieval experiment across multiple retrieval techniques."""
+        strats = strategies or ["semantic", "bm25", "hybrid", "rrf", "mmr", "rerank"]
+        report: dict[str, list[dict[str, Any]]] = {}
+        for st in strats:
+            hits = self.retrieve(query, top_k=top_k, retrieval_strategy=st)
+            report[st] = [
+                {
+                    "rank": h.rank,
+                    "score": round(h.score, 4),
+                    "chunk_strategy": h.chunk.strategy,
+                    "section_path": h.chunk.section_path,
+                    "preview": h.chunk.text[:140],
+                }
+                for h in hits
+            ]
+        return report
+
+
+def _resolve_source_doc(source: str | Path | ParsedDocument, force_law: bool = False) -> ParsedDocument:
+    if isinstance(source, ParsedDocument):
+        return source
+    if isinstance(source, Path):
+        return parser_mod.parse_law(source) if force_law else parser_mod.parse(source, mode="auto")
+    if isinstance(source, str) and "\n" not in source and len(source) < 260:
+        cand = Path(source)
+        if cand.exists():
+            return parser_mod.parse_law(cand) if force_law else parser_mod.parse(cand, mode="auto")
+        if cand.suffix.lower() in (".pdf", ".txt", ".md", ".markdown"):
+            raise FileNotFoundError(f"File not found: {cand}")
+    return parser_mod.parse_text(str(source), mode="law" if force_law else "auto")
+
+
+def create(
+    source: str | Path | ParsedDocument,
+    chunk_strategy: str | list[str] = "recursive",
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+    overlap: int | None = None,
+    combination_mode: str = "ensemble",
+    embed_provider: str = "fast_local",
+    embed_strategy: str = "dense",
+    embed_model: str | None = None,
+    embed_api_key: str | None = None,
+    embed_dimension: int = 384,
+    retrieval_strategy: str = "hybrid",
+    vectordb: str = "chroma",
+    backend: str | None = None,
+    collection_name: str = "raglib_general",
+    persist_directory: str | Path | None = None,
+    prompt_technique: str = "standard",
+    prompt: str | None = None,
+    technique: str | None = None,
+    system_prompt: str | None = None,
+    llm_provider: str = "extractive",
+    provider: str | None = None,
+    llm_model: str | None = None,
+    model: str | None = None,
+    llm_api_key: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    rewrite_queries: bool = True,
+    **vectordb_kwargs: Any,
+) -> RAGPipeline:
+    """
+    Create a full RAG pipeline for ANY general document, PDF, text file, or string.
+    Supports single or combined chunking strategies (`chunk_strategy=["recursive", "semantic"]`),
+    customizable embedding strategies (`embed_strategy`), customizable retrieval strategies (`retrieval_strategy`),
+    prompt engineering (`prompt_technique` & `system_prompt`), and LLM (`llm_provider`, `llm_model`, `llm_api_key`).
+    """
+    chosen_tech = prompt or technique or prompt_technique
+    chosen_llm_prov = provider or llm_provider
+    chosen_llm_model = model or llm_model
+    chosen_llm_key = llm_api_key or api_key
+    chosen_embed_key = embed_api_key or api_key
+    chosen_vdb = backend or vectordb
+    eff_overlap = overlap if overlap is not None else chunk_overlap
+
+    doc = _resolve_source_doc(source, force_law=False)
+    chunks = chunker_mod.chunk(
+        doc,
+        strategy=chunk_strategy,
+        chunk_size=chunk_size,
+        chunk_overlap=eff_overlap,
+        combination_mode=combination_mode,
+    )
+    embeddings = embedder_mod.embed(
+        chunks,
+        provider=embed_provider,
+        strategy=embed_strategy,
+        model=embed_model,
+        api_key=chosen_embed_key,
+        dimension=embed_dimension,
+    )
+    store = vectordb_mod.connect(
+        provider=chosen_vdb,
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        api_key=api_key,
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        embed_model=embed_model,
+        embed_api_key=chosen_embed_key,
+        embed_dimension=embed_dimension,
+        **vectordb_kwargs,
+    )
+    store.add(chunks, embeddings)
+
+    return RAGPipeline(
+        document=doc,
+        chunks=chunks,
+        store=store,
+        mode="general",
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        embed_model=embed_model,
+        embed_api_key=chosen_embed_key,
+        embed_dimension=embed_dimension,
+        retrieval_strategy=retrieval_strategy,
+        llm_provider=chosen_llm_prov,
+        llm_model=chosen_llm_model,
+        llm_api_key=chosen_llm_key,
+        llm_base_url=base_url,
+        prompt_technique=chosen_tech,
+        system_prompt=system_prompt,
+        rewrite_queries=rewrite_queries,
+    )
+
+
+def create_law(
+    source: str | Path | ParsedDocument,
+    chunk_strategy: str | list[str] = "legal_clause",
+    chunk_size: int = 900,
+    chunk_overlap: int = 100,
+    overlap: int | None = None,
+    combination_mode: str = "ensemble",
+    embed_provider: str = "fast_local",
+    embed_strategy: str = "legal_domain_boost",
+    embed_model: str | None = None,
+    embed_api_key: str | None = None,
+    embed_dimension: int = 384,
+    retrieval_strategy: str = "rerank",
+    vectordb: str = "chroma",
+    backend: str | None = None,
+    collection_name: str = "raglib_law",
+    persist_directory: str | Path | None = None,
+    prompt_technique: str = "natural_law",
+    prompt: str | None = None,
+    technique: str | None = None,
+    system_prompt: str | None = None,
+    llm_provider: str = "extractive",
+    provider: str | None = None,
+    llm_model: str | None = None,
+    model: str | None = None,
+    llm_api_key: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    rewrite_queries: bool = True,
+    **vectordb_kwargs: Any,
+) -> RAGPipeline:
+    """
+    Specialized One-Command Law RAG Pipeline:
+    1. Parses with Legal Regex Intelligence (`parser.parse_law`)
+    2. Chunks by statutory/contractual hierarchy (`chunk_strategy="legal_clause"` or combined `["legal_clause", "semantic"]`)
+    3. Embeds with `embed_strategy="legal_domain_boost"`
+    4. Indexes into VectorDB (`vectordb="chroma"` by default) and retrieves with 2-stage legal reranking (`retrieval_strategy="rerank"`)
+    5. Automatically rewrites Legal & Story Queries (`rewrite_law_query`) to map stories/scenarios to exact Articles/Sections
+    6. Generates natural, fluent legal sentences by default, and switches to IRAC only when the user writes 'IRAC' in their query!
+    """
+    chosen_tech = prompt or technique or prompt_technique
+    chosen_llm_prov = provider or llm_provider
+    chosen_llm_model = model or llm_model
+    chosen_llm_key = llm_api_key or api_key
+    chosen_embed_key = embed_api_key or api_key
+    chosen_vdb = backend or vectordb
+    eff_overlap = overlap if overlap is not None else chunk_overlap
+
+    doc = _resolve_source_doc(source, force_law=True)
+    if chunk_strategy == "legal_clause":
+        chunks = chunker_mod.chunk_law(doc, chunk_size=chunk_size, chunk_overlap=eff_overlap)
+    else:
+        chunks = chunker_mod.chunk(
+            doc,
+            strategy=chunk_strategy,
+            chunk_size=chunk_size,
+            chunk_overlap=eff_overlap,
+            combination_mode=combination_mode,
+        )
+
+    embeddings = embedder_mod.embed(
+        chunks,
+        provider=embed_provider,
+        strategy=embed_strategy,
+        model=embed_model,
+        api_key=chosen_embed_key,
+        dimension=embed_dimension,
+    )
+    store = vectordb_mod.connect(
+        provider=chosen_vdb,
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        api_key=api_key,
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        embed_model=embed_model,
+        embed_api_key=chosen_embed_key,
+        embed_dimension=embed_dimension,
+        **vectordb_kwargs,
+    )
+    store.add(chunks, embeddings)
+
+    return RAGPipeline(
+        document=doc,
+        chunks=chunks,
+        store=store,
+        mode="law",
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        embed_model=embed_model,
+        embed_api_key=chosen_embed_key,
+        embed_dimension=embed_dimension,
+        retrieval_strategy=retrieval_strategy,
+        llm_provider=chosen_llm_prov,
+        llm_model=chosen_llm_model,
+        llm_api_key=chosen_llm_key,
+        llm_base_url=base_url,
+        prompt_technique=chosen_tech,
+        system_prompt=system_prompt,
+        rewrite_queries=rewrite_queries,
+    )
+
+
+def ask(
+    source: str | Path | ParsedDocument,
+    query: str,
+    top_k: int = 5,
+    chunk_strategy: str | list[str] = "recursive",
+    embed_provider: str = "fast_local",
+    embed_strategy: str = "dense",
+    retrieval_strategy: str = "hybrid",
+    vectordb: str = "chroma",
+    prompt_technique: str = "standard",
+    system_prompt: str | None = None,
+    llm_provider: str = "extractive",
+    llm_model: str | None = None,
+    llm_api_key: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> RAGResponse:
+    """One-line general RAG execution."""
+    pipe = create(
+        source=source,
+        chunk_strategy=chunk_strategy,
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        retrieval_strategy=retrieval_strategy,
+        vectordb=vectordb,
+        prompt_technique=prompt_technique,
+        system_prompt=system_prompt,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key or api_key,
+        base_url=base_url,
+    )
+    return pipe.ask(query=query, top_k=top_k)
+
+
+def ask_law(
+    source: str | Path | ParsedDocument,
+    query: str,
+    top_k: int = 5,
+    chunk_strategy: str | list[str] = "legal_clause",
+    embed_provider: str = "fast_local",
+    embed_strategy: str = "legal_domain_boost",
+    retrieval_strategy: str = "rerank",
+    vectordb: str = "chroma",
+    prompt_technique: str = "natural_law",
+    system_prompt: str | None = None,
+    llm_provider: str = "extractive",
+    llm_model: str | None = None,
+    llm_api_key: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> RAGResponse:
+    """Specialized One-Line Law RAG execution."""
+    pipe = create_law(
+        source=source,
+        chunk_strategy=chunk_strategy,
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        retrieval_strategy=retrieval_strategy,
+        vectordb=vectordb,
+        prompt_technique=prompt_technique,
+        system_prompt=system_prompt,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key or api_key,
+        base_url=base_url,
+    )
+    return pipe.ask(query=query, top_k=top_k)
+
+
+rewrite_query = prompt_mod.rewrite_query
+rewrite_law_query = prompt_mod.rewrite_law_query
+
+
+__all__ = [
+    "RAGPipeline",
+    "RAGResponse",
+    "create",
+    "create_law",
+    "ask",
+    "ask_law",
+    "rewrite_query",
+    "rewrite_law_query",
+]
+
+

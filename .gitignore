@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Pytest / test caches
+.pytest_cache/
+.coverage
+
+# Local ChromaDB / generated files
+*.chroma.json
+chroma_db/
+sample_legal_judgment.pdf
+
+# Agent / BMAD local tooling
+.agent/
+.agents/
+.cline/
+.opencode/
+_bmad/
+_bmad-output/
