@@ -35,9 +35,11 @@ class SmartParser:
         extract_tables: bool | str = False,
         unwrap_lines: bool = True,
         custom_regexes: dict[str, str | re.Pattern[str]] | None = None,
+        ocr: bool | str = "auto",
+        api_key: str | None = None,
     ) -> ParsedDocument:
         """
-        One-command smart parser for PDFs (and .txt/.md files).
+        One-command smart parser for PDFs (and .txt/.md files) with Smart Per-Page Hybrid OCR fallback.
 
         Args:
             source: Path to the PDF (or text/markdown) file.
@@ -47,6 +49,9 @@ class SmartParser:
                   or "deep" (pdfplumber full page inspection).
             unwrap_lines: Whether to unwrap broken mid-sentence lines while preserving structure.
             custom_regexes: Optional dictionary of `{name: regex_pattern}` to extract custom matches.
+            ocr: "auto" (default — runs OCR only on scanned/image-only pages), "force" (runs OCR on all pages),
+                 "tesseract", "rapidocr", "gemini_vision", or False.
+            api_key: Optional Gemini API key (`AIza...` or `AQ....`) for multimodal Gemini Vision OCR fallback.
 
         Returns:
             ParsedDocument with clean text, Markdown, tables, and (if legal) hierarchical sections,
@@ -62,7 +67,7 @@ class SmartParser:
 
         path = Path(source)
         pages_raw_data, tables_by_page, doc_meta, engine_used = extract_pdf_hybrid(
-            path, extract_tables=extract_tables
+            path, extract_tables=extract_tables, ocr=ocr, api_key=api_key
         )
 
 
@@ -121,14 +126,18 @@ class SmartParser:
         extract_tables: bool | str = False,
         unwrap_lines: bool = True,
         custom_regexes: dict[str, str | re.Pattern[str]] | None = None,
+        ocr: bool | str = "auto",
+        api_key: str | None = None,
     ) -> ParsedDocument:
-        """Explicitly parse a PDF or text file using the full Legal Regex Intelligence pipeline."""
+        """Explicitly parse a PDF or text file using the full Legal Regex Intelligence pipeline + Hybrid OCR."""
         return self.parse(
             source=source,
             mode="law",
             extract_tables=extract_tables,
             unwrap_lines=unwrap_lines,
             custom_regexes=custom_regexes,
+            ocr=ocr,
+            api_key=api_key,
         )
 
     def parse_unstructured(
@@ -137,14 +146,18 @@ class SmartParser:
         extract_tables: bool | str = False,
         unwrap_lines: bool = True,
         custom_regexes: dict[str, str | re.Pattern[str]] | None = None,
+        ocr: bool | str = "auto",
+        api_key: str | None = None,
     ) -> ParsedDocument:
-        """Explicitly parse a PDF or text file using only the Unstructured Layout & Table pipeline."""
+        """Explicitly parse a PDF or text file using only the Unstructured Layout & Table pipeline + Hybrid OCR."""
         return self.parse(
             source=source,
             mode="unstructured",
             extract_tables=extract_tables,
             unwrap_lines=unwrap_lines,
             custom_regexes=custom_regexes,
+            ocr=ocr,
+            api_key=api_key,
         )
 
     def parse_text(

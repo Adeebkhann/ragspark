@@ -39,19 +39,123 @@ def _rows_to_markdown(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _ocr_scanned_page(page: Any, ocr_mode: bool | str = "auto", api_key: str | None = None) -> tuple[str, str]:
+    """
+    Smart Per-Page Hybrid OCR Fallback (only triggered on scanned/image pages where digital text is empty):
+      1. PyMuPDF Native C-Level Tesseract OCR (`page.get_textpage_ocr()`)
+      2. RapidOCR ONNX CPU (`rapidocr_onnxruntime` — zero external binary needed)
+      3. `pytesseract` + PIL Image fallback
+      4. Gemini Vision OCR (`gemini-2.5-flash` multimodal transcription when `api_key` or `GEMINI_API_KEY` is set)
+    Returns `(extracted_text, ocr_engine_used)`.
+    """
+    import base64
+    import json
+    import os
+    import urllib.request
+
+    mode_str = "auto" if ocr_mode is True else str(ocr_mode).lower().strip()
+
+    # 1. PyMuPDF Native C-Level OCR (fastest when Tesseract tessdata is available on system)
+    if mode_str in ("auto", "tesseract", "pymupdf_ocr"):
+        try:
+            tp = page.get_textpage_ocr(flags=0, dpi=200, full=True)
+            ocr_txt = (page.get_text("text", textpage=tp) or "").strip()
+            if ocr_txt:
+                return ocr_txt, "pymupdf_tesseract_ocr"
+        except Exception:
+            pass
+
+    # Render page to PNG bytes at 200 DPI for RapidOCR / Pytesseract / Gemini Vision
+    try:
+        pix = page.get_pixmap(dpi=200)
+        png_bytes: bytes = pix.tobytes("png")
+    except Exception:
+        return "", ""
+
+    # 2. RapidOCR (Pure Python + ONNX Runtime on CPU — no system binary required)
+    if mode_str in ("auto", "rapidocr"):
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-not-found]
+
+            engine = RapidOCR()
+            result, _ = engine(png_bytes)
+            if result:
+                lines = [str(item[1]).strip() for item in result if len(item) >= 2 and str(item[1]).strip()]
+                if lines:
+                    return "\n".join(lines), "rapidocr_onnx"
+        except Exception:
+            pass
+
+    # 3. Pytesseract + Pillow fallback
+    if mode_str in ("auto", "tesseract", "pytesseract"):
+        try:
+            import io
+            from PIL import Image  # type: ignore[import-not-found]
+            import pytesseract  # type: ignore[import-not-found]
+
+            img = Image.open(io.BytesIO(png_bytes))
+            tess_txt = (pytesseract.image_to_string(img) or "").strip()
+            if tess_txt:
+                return tess_txt, "pytesseract_ocr"
+        except Exception:
+            pass
+
+    # 4. Gemini Vision Multimodal OCR (Transcribes scanned pages, stamps, & tables via Gemini Flash Vision)
+    key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if key and mode_str in ("auto", "gemini", "gemini_vision", "vision"):
+        try:
+            b64_img = base64.b64encode(png_bytes).decode("ascii")
+            url = (
+                f"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key={key}"
+                if key.startswith("AQ.")
+                else f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+            )
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": "Transcribe all text from this scanned document page accurately, preserving headings, clauses, and tables."},
+                            {"inlineData": {"mimeType": "image/png", "data": b64_img}},
+                        ],
+                    }
+                ]
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                cands = data.get("candidates", [])
+                if cands:
+                    parts = cands[0].get("content", {}).get("parts", [])
+                    vis_txt = "".join(p.get("text", "") for p in parts).strip()
+                    if vis_txt:
+                        return vis_txt, "gemini_vision_ocr"
+        except Exception:
+            pass
+
+    return "", ""
+
+
 def extract_with_pymupdf_fast(
     pdf_path: Path,
     extract_tables: bool | str = False,
+    ocr: bool | str = "auto",
+    api_key: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[int, list[TableBlock]], dict[str, Any]]:
     """
-    Ultra-fast C-level PyMuPDF extraction using `get_text("blocks")`.
-    Avoids creating thousands of Python span dicts per page and avoids slow pdfminer/pdfplumber loops.
+    Ultra-fast C-level PyMuPDF extraction using `get_text("blocks")` with Smart Per-Page Hybrid OCR fallback
+    for scanned/image-only pages (`len(raw_text) < 20`).
     """
     import pymupdf as fitz
 
     pages_data: list[dict[str, Any]] = []
     tables_by_page: dict[int, list[TableBlock]] = {}
     doc_meta: dict[str, Any] = {}
+    ocr_engines_triggered: list[str] = []
 
     with fitz.open(str(pdf_path)) as doc:
         raw_meta = doc.metadata or {}
@@ -83,6 +187,14 @@ def extract_with_pymupdf_fast(
                                 headings.append(b_text)
 
             raw_text = "\n\n".join(text_chunks)
+            # If the page has almost no embedded digital text (scanned image PDF page) or ocr="force", run Per-Page Hybrid OCR!
+            if ocr and (ocr == "force" or len(raw_text.strip()) < 20):
+                ocr_text, ocr_used = _ocr_scanned_page(page, ocr_mode=ocr, api_key=api_key)
+                if ocr_text:
+                    raw_text = ocr_text
+                    if ocr_used and ocr_used not in ocr_engines_triggered:
+                        ocr_engines_triggered.append(ocr_used)
+
             pages_data.append(
                 {
                     "page_number": page_idx,
@@ -120,6 +232,9 @@ def extract_with_pymupdf_fast(
                             tables_by_page[page_idx] = page_tables
                 except Exception:
                     pass
+
+        if ocr_engines_triggered:
+            doc_meta["ocr_engines_used"] = ocr_engines_triggered
 
     return pages_data, tables_by_page, doc_meta
 
@@ -188,11 +303,14 @@ def extract_with_pypdf(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[str, 
 def extract_pdf_hybrid(
     pdf_path: str | Path,
     extract_tables: bool | str = False,
+    ocr: bool | str = "auto",
+    api_key: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[int, list[TableBlock]], dict[str, Any], str]:
     """
     Master high-speed PDF & document extractor:
     - Defaults to `extract_tables=False` (or `"fast"` using PyMuPDF C-level table detection on pages with drawings)
       so large PDFs parse in milliseconds without freezing laptops.
+    - Automatically runs Per-Page Hybrid OCR (`ocr="auto"`) ONLY on scanned/image-only pages (`len(raw_text) < 20`).
     - Pass `extract_tables="deep"` to force full pdfplumber scanning.
     """
     path = Path(pdf_path)
@@ -219,9 +337,11 @@ def extract_pdf_hybrid(
 
     try:
         pages_data, tables_by_page, doc_meta = extract_with_pymupdf_fast(
-            path, extract_tables=extract_tables
+            path, extract_tables=extract_tables, ocr=ocr, api_key=api_key
         )
         engines_used.append("pymupdf_fast")
+        if doc_meta.get("ocr_engines_used"):
+            engines_used.extend(doc_meta["ocr_engines_used"])
     except Exception:
         pages_data, doc_meta = extract_with_pypdf(path)
         engines_used.append("pypdf")

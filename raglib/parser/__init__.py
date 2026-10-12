@@ -32,14 +32,18 @@ def parse(
     extract_tables: bool | str = False,
     unwrap_lines: bool = True,
     custom_regexes: dict[str, str | re.Pattern[str]] | None = None,
+    ocr: bool | str = "auto",
+    api_key: str | None = None,
 ) -> ParsedDocument:
-    """One-command smart parser for unstructured & legal PDFs (blazing fast C-level extraction)."""
+    """One-command smart parser for unstructured & legal PDFs (blazing fast C-level extraction + Per-Page Hybrid OCR)."""
     return default_parser.parse(
         source=source,
         mode=mode,
         extract_tables=extract_tables,
         unwrap_lines=unwrap_lines,
         custom_regexes=custom_regexes,
+        ocr=ocr,
+        api_key=api_key,
     )
 
 
@@ -48,13 +52,17 @@ def parse_law(
     extract_tables: bool | str = False,
     unwrap_lines: bool = True,
     custom_regexes: dict[str, str | re.Pattern[str]] | None = None,
+    ocr: bool | str = "auto",
+    api_key: str | None = None,
 ) -> ParsedDocument:
-    """One-command legal PDF parser using Hierarchical & Citation Regex Intelligence."""
+    """One-command legal PDF parser using Hierarchical & Citation Regex Intelligence + Per-Page Hybrid OCR."""
     return default_parser.parse_law(
         source=source,
         extract_tables=extract_tables,
         unwrap_lines=unwrap_lines,
         custom_regexes=custom_regexes,
+        ocr=ocr,
+        api_key=api_key,
     )
 
 
@@ -63,13 +71,17 @@ def parse_unstructured(
     extract_tables: bool | str = False,
     unwrap_lines: bool = True,
     custom_regexes: dict[str, str | re.Pattern[str]] | None = None,
+    ocr: bool | str = "auto",
+    api_key: str | None = None,
 ) -> ParsedDocument:
-    """One-command unstructured PDF parser (layout + headings + text cleaner)."""
+    """One-command unstructured PDF parser (layout + headings + text cleaner + Per-Page Hybrid OCR)."""
     return default_parser.parse_unstructured(
         source=source,
         extract_tables=extract_tables,
         unwrap_lines=unwrap_lines,
         custom_regexes=custom_regexes,
+        ocr=ocr,
+        api_key=api_key,
     )
 
 
