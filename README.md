@@ -102,4 +102,4 @@ ragspark ask-law constitution.pdf "Explain Article 21"
 
 ## 📄 License
 
-MIT License. See [`RAGLIB_DOCUMENTATION.md`](RAGLIB_DOCUMENTATION.md) for the complete command reference.
+MIT License. See [`RAGSPARK_DOCUMENTATION.md`](RAGSPARK_DOCUMENTATION.md) for the complete command reference.
