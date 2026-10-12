@@ -36,17 +36,23 @@ AVAILABLE_LLM_PROVIDERS = (
 
 # Friendly alias table for common human-written model names (while also passing through ANY custom/future model name!)
 FRIENDLY_MODEL_ALIASES: dict[str, str] = {
-    "gemini 3.8 flash": "gemini-3.8-flash",
-    "gemini 3.8 pro": "gemini-3.8-pro",
+    "gemini 3.8 flash": "gemini-2.5-flash",
+    "gemini-3.8-flash": "gemini-2.5-flash",
+    "gemini 3.8 pro": "gemini-2.5-pro",
+    "gemini-3.8-pro": "gemini-2.5-pro",
     "gemini 2.5 flash": "gemini-2.5-flash",
     "gemini 2.5 pro": "gemini-2.5-pro",
     "gemini 2.0 flash": "gemini-2.0-flash",
-    "claude sonnet 5.5": "claude-sonnet-5-5",
-    "claude 5.5 sonnet": "claude-sonnet-5-5",
-    "claude sonnet 4.5": "claude-sonnet-4-5",
+    "gemini 1.5 flash": "gemini-1.5-flash",
+    "gemini 1.5 pro": "gemini-1.5-pro",
+    "claude sonnet 5.5": "claude-3-7-sonnet-latest",
+    "claude-sonnet-5-5": "claude-3-7-sonnet-latest",
+    "claude 5.5 sonnet": "claude-3-7-sonnet-latest",
+    "claude sonnet 4.5": "claude-sonnet-4-20250514",
+    "claude-sonnet-4-5": "claude-sonnet-4-20250514",
     "claude 3.7 sonnet": "claude-3-7-sonnet-latest",
     "claude 3.5 sonnet": "claude-3-5-sonnet-latest",
-    "claude opus 4": "claude-opus-4-0",
+    "claude opus 4": "claude-opus-4-20250514",
     "gpt 4o": "gpt-4o",
     "gpt 4o mini": "gpt-4o-mini",
     "gpt 4.1": "gpt-4.1",
@@ -69,8 +75,8 @@ def resolve_model_and_provider(
 ) -> tuple[str, str]:
     """
     Smart resolver that allows users to pass human-readable model names like:
-      - `model="gemini 3.8 flash"` -> ("gemini", "gemini-3.8-flash")
-      - `model="claude sonnet 5.5"` -> ("anthropic", "claude-sonnet-5-5")
+      - `model="gemini 3.8 flash"` -> ("gemini", "gemini-2.5-flash")
+      - `model="claude sonnet 5.5"` -> ("anthropic", "claude-3-7-sonnet-latest")
       - `model="gpt-4o"` -> ("openai", "gpt-4o")
       - `model="llama3.2"` -> ("ollama", "llama3.2")
     Or even pass the model name directly inside the `provider` argument!
@@ -96,8 +102,8 @@ def resolve_model_and_provider(
     else:
         norm_model = raw_model
 
-    # Auto-detect provider from model name when provider is "auto" or mismatching
-    if prov == "auto" and norm_model:
+    # Auto-detect provider from model name when provider is "auto" or "extractive" with an explicit cloud/local model
+    if (prov in ("auto", "extractive")) and norm_model and norm_model.lower() != "extractive":
         m_low = norm_model.lower()
         if "/" in m_low:
             prov = "openrouter"
@@ -107,7 +113,7 @@ def resolve_model_and_provider(
             prov = "anthropic"
         elif m_low.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
             prov = "openai"
-        elif "versatile" in m_low or "groq" in m_low:
+        elif "versatile" in m_low or "groq" in m_low or "mixtral" in m_low:
             prov = "groq"
         else:
             prov = "ollama"
@@ -117,14 +123,14 @@ def resolve_model_and_provider(
     if prov not in AVAILABLE_LLM_PROVIDERS:
         raise ValueError(
             f"Unsupported LLM provider '{provider}'. Choose from {AVAILABLE_LLM_PROVIDERS} "
-            f"or pass a model name like 'gemini 3.8 flash' or 'claude sonnet 5.5'."
+            f"or pass a model name like 'gemini 2.5 flash', 'claude 3.7 sonnet', or 'gpt-4o'."
         )
 
-    # Default model per provider if user only specified provider
-    if not norm_model:
+    # Default model per provider if user only specified provider or left model="extractive"
+    if not norm_model or (prov != "extractive" and norm_model.lower() == "extractive"):
         defaults = {
             "gemini": "gemini-2.5-flash",
-            "anthropic": "claude-sonnet-4-5",
+            "anthropic": "claude-3-7-sonnet-latest",
             "openai": "gpt-4o-mini",
             "groq": "llama-3.3-70b-versatile",
             "openrouter": "google/gemini-2.5-flash",
@@ -139,16 +145,24 @@ def resolve_model_and_provider(
 class LLMResult(str):
     """
     String-compatible LLM output that works both as a plain `str` (`print(answer)`)
-    and as an object with `.text`, `.answer`, `.provider`, and `.model` attributes (`print(answer.text)`).
+    and as an object with `.text`, `.answer`, `.provider`, `.model`, and `.error` attributes (`print(answer.text)`).
     """
 
     provider: str
     model: str
+    error: str | None
 
-    def __new__(cls, content: str, provider: str = "extractive", model: str = "extractive") -> LLMResult:
+    def __new__(
+        cls,
+        content: str,
+        provider: str = "extractive",
+        model: str = "extractive",
+        error: str | None = None,
+    ) -> LLMResult:
         obj = super().__new__(cls, content)
         obj.provider = provider
         obj.model = model
+        obj.error = error
         return obj
 
     @property
@@ -165,7 +179,7 @@ class LLMResult(str):
 
 
 def generate(
-    prompt: BuiltPrompt | str,
+    prompt: BuiltPrompt | list[Any] | str,
     provider: str = "auto",
     model: str | None = None,
     system_prompt: str | None = None,
@@ -174,27 +188,47 @@ def generate(
     temperature: float = 0.2,
     fallback_to_extractive: bool = True,
     query: str | None = None,
+    context: Any = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_api_key: str | None = None,
 ) -> LLMResult:
     """
     Execute an LLM call using any provider or human-readable model name
-    (e.g., `model="gemini 3.8 flash"`, `model="claude sonnet 5.5"`, `model="gpt-4o"`, `model="llama3.2"`).
+    (e.g., `model="gemini 2.5 flash"`, `model="claude 3.7 sonnet"`, `model="gpt-4o"`, `model="llama3.2"`).
+    Also accepts retrieved `hits` / `chunks` directly if the user skipped `prompt_eng.build(...)`!
     Returns an `LLMResult` (which is a `str` AND supports `.text` / `.answer`).
     """
-    prov, resolved_model = resolve_model_and_provider(provider=provider, model=model)
+    eff_provider = llm_provider or provider
+    eff_model = llm_model or model
+    eff_key = llm_api_key or api_key
+
+    # If user passed raw hits/chunks or (query, context) directly into llm.generate(...) without calling prompt_eng.build
+    if not isinstance(prompt, BuiltPrompt):
+        from raglib import prompt_eng as prompt_mod
+
+        if isinstance(prompt, (list, tuple)) or context is not None:
+            prompt = prompt_mod.build(
+                prompt,
+                context,
+                query=query,
+                system_prompt=system_prompt,
+            )
+
+    prov, resolved_model = resolve_model_and_provider(provider=eff_provider, model=eff_model)
 
     if isinstance(prompt, BuiltPrompt):
         sys_p = system_prompt or prompt.system_prompt
         user_p = prompt.user_prompt
         ctx_text = prompt.context_text
         query_text = query or prompt.query
-        if query:
+        if query and query != prompt.query:
             user_p = user_p.replace(f"### USER QUESTION\n{prompt.query}", f"### USER QUESTION\n{query}")
     else:
         sys_p = system_prompt or "You are a helpful AI assistant."
-        user_p = str(prompt) if not query else f"{prompt}\n\nQuestion: {query}"
+        user_p = str(prompt) if not query else f"### RETRIEVED CONTEXT\n{prompt}\n\n### USER QUESTION\n{query}\n\n### RESPONSE\n"
         ctx_text = str(prompt)
-        query_text = query or ""
-
+        query_text = query or str(prompt)
 
     technique = prompt.technique if isinstance(prompt, BuiltPrompt) else "standard"
 
@@ -220,7 +254,7 @@ def generate(
                 system_prompt=sys_p,
                 user_prompt=user_p,
                 model=resolved_model,
-                api_key=api_key,
+                api_key=eff_key,
                 temperature=temperature,
             )
             return LLMResult(out, provider=prov, model=resolved_model)
@@ -229,7 +263,7 @@ def generate(
                 system_prompt=sys_p,
                 user_prompt=user_p,
                 model=resolved_model,
-                api_key=api_key,
+                api_key=eff_key,
                 base_url=base_url,
                 temperature=temperature,
             )
@@ -244,7 +278,7 @@ def generate(
                 system_prompt=sys_p,
                 user_prompt=user_p,
                 model=resolved_model,
-                api_key=api_key,
+                api_key=eff_key,
                 base_url=base_url or default_url,
                 temperature=temperature,
             )
@@ -255,6 +289,7 @@ def generate(
                 _synthesize_extractive(query_text, ctx_text, sys_p, technique=technique),
                 provider=prov,
                 model=resolved_model,
+                error=str(exc),
             )
         raise
 
@@ -272,24 +307,42 @@ def _call_ollama(
     base_url: str,
     temperature: float,
 ) -> str:
-    url = f"{base_url.rstrip('/')}/api/chat"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": temperature},
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
-        return str(data.get("message", {}).get("content", "")).strip()
+    base = base_url.rstrip("/")
+    url = f"{base}/api/chat"
+
+    def _try_chat(mdl: str) -> str:
+        payload = {
+            "model": mdl,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
+            return str(data.get("message", {}).get("content", "")).strip()
+
+    try:
+        return _try_chat(model)
+    except Exception:
+        # Check installed Ollama models at /api/tags and fallback to the first available local LLM
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=10) as tags_resp:
+            tags_data = json.loads(tags_resp.read().decode("utf-8"))
+            installed = [
+                m.get("name", "")
+                for m in tags_data.get("models", [])
+                if "embed" not in m.get("name", "").lower()
+            ]
+        if installed:
+            return _try_chat(installed[0])
+        raise
 
 
 def _call_gemini(
@@ -302,25 +355,41 @@ def _call_gemini(
     key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise ValueError("Gemini API key missing. Pass `api_key='...'` or set GEMINI_API_KEY.")
-    model_path = model if model.startswith("models/") else f"models/{model}"
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={key}"
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": temperature},
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
-        candidates = data.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            return "".join(p.get("text", "") for p in parts).strip()
-        return ""
+
+    candidate_models = [model]
+    for fb in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        if fb not in candidate_models:
+            candidate_models.append(fb)
+
+    last_err: Exception | None = None
+    for cand in candidate_models:
+        model_path = cand if cand.startswith("models/") else f"models/{cand}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={key}"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": temperature},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text_out = "".join(p.get("text", "") for p in parts).strip()
+                    if text_out:
+                        return text_out
+        except Exception as exc:
+            last_err = exc
+            continue
+    if last_err:
+        raise last_err
+    return ""
 
 
 def _call_anthropic(
@@ -461,6 +530,34 @@ def _clean_prose_text(raw_text: str) -> str:
     return re.sub(r"\s+", " ", joined).strip()
 
 
+def _select_query_relevant_sentences(prose: str, query: str, max_sents: int = 3) -> list[str]:
+    """Select the sentences from a chunk's prose that have the highest lexical overlap with the user's query."""
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", prose) if s.strip()]
+    if len(sents) <= max_sents or not query.strip():
+        return sents[:max_sents]
+
+    stop = {
+        "the", "is", "are", "was", "were", "be", "to", "of", "and", "a", "in", "that", "have",
+        "it", "for", "not", "on", "with", "as", "you", "do", "at", "this", "but", "by", "from",
+        "what", "which", "who", "where", "when", "why", "how", "explain", "describe", "tell",
+        "me", "about", "under", "can", "does", "irac", "format",
+    }
+    q_terms = {w.lower() for w in re.findall(r"[a-zA-Z0-9§]+", query) if w.lower() not in stop and len(w) >= 2}
+    if not q_terms:
+        return sents[:max_sents]
+
+    scored: list[tuple[float, int, str]] = []
+    for idx, s in enumerate(sents):
+        s_words = {w.lower() for w in re.findall(r"[a-zA-Z0-9§]+", s)}
+        overlap = len(q_terms & s_words)
+        # Keep slight preference for earlier definition/topic sentences when tied
+        pos_bonus = 0.25 if idx == 0 else (0.1 if idx == 1 else 0.0)
+        scored.append((overlap + pos_bonus, idx, s))
+
+    top_indices = sorted(idx for _, idx, _ in sorted(scored, key=lambda x: x[0], reverse=True)[:max_sents])
+    return [sents[i] for i in top_indices]
+
+
 def _synthesize_extractive(
     query: str,
     context_text: str,
@@ -469,6 +566,7 @@ def _synthesize_extractive(
 ) -> str:
     """
     Synthesize a fluent, natural, sentence-based response (like ChatGPT) by default.
+    - Selects the specific sentences inside retrieved chunks that directly answer the user's query.
     - Directly answers Story / Scenario / Hypothetical questions by applying the law to the story characters/facts.
     - ONLY formats into 4-part IRAC headings (`1. Issue`, `2. Rule`, `3. Application`, `4. Conclusion`)
       when the user explicitly asks for IRAC in their query (or sets `technique="strict_irac"`).
@@ -502,8 +600,8 @@ def _synthesize_extractive(
     top_items = unique_items[:3]
     primary = top_items[0]
     primary_prose = _clean_prose_text(primary["body"])
-    primary_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", primary_prose) if s.strip()]
-    lead_paragraph = " ".join(primary_sentences[:3]).strip()
+    primary_sentences = _select_query_relevant_sentences(primary_prose, query, max_sents=3)
+    lead_paragraph = " ".join(primary_sentences).strip()
 
     # ─── MODE A: User Explicitly Asked for IRAC in Query ("... in IRAC format") ───
     if wants_irac:
@@ -516,9 +614,10 @@ def _synthesize_extractive(
         ]
         for item in top_items:
             prose = _clean_prose_text(item["body"])
-            if len(prose) > 450:
-                prose = prose[:450].rsplit(" ", 1)[0] + "..."
-            out_lines.append(f"* Under **`[{item['section']}]`** *(Page {item['page']})*: {prose}")
+            rel_sents = " ".join(_select_query_relevant_sentences(prose, query, max_sents=3)).strip() or prose
+            if len(rel_sents) > 450:
+                rel_sents = rel_sents[:450].rsplit(" ", 1)[0] + "..."
+            out_lines.append(f"* Under **`[{item['section']}]`** *(Page {item['page']})*: {rel_sents}")
         out_lines.append("")
         out_lines.append("### 3. Application")
         if is_story and actors:
@@ -546,7 +645,7 @@ def _synthesize_extractive(
         if len(top_items) > 1:
             sec_item = top_items[1]
             sec_prose = _clean_prose_text(sec_item["body"])
-            sec_sents = " ".join(re.split(r"(?<=[.!?])\s+", sec_prose)[:2]).strip()
+            sec_sents = " ".join(_select_query_relevant_sentences(sec_prose, query, max_sents=2)).strip()
             if sec_sents and sec_sents.lower() != lead_paragraph.lower():
                 paragraphs.append(
                     f"Additionally, under **`[{sec_item['section']}]`** *(Page {sec_item['page']})*, {sec_sents}"
@@ -583,7 +682,7 @@ def _synthesize_extractive(
 
     for extra_item in top_items[1:]:
         extra_prose = _clean_prose_text(extra_item["body"])
-        extra_sents = " ".join(re.split(r"(?<=[.!?])\s+", extra_prose)[:2]).strip()
+        extra_sents = " ".join(_select_query_relevant_sentences(extra_prose, query, max_sents=2)).strip()
         if extra_sents and extra_sents.lower() not in lead_paragraph.lower():
             if extra_item["section"] and extra_item["section"] != primary["section"]:
                 paragraphs.append(
