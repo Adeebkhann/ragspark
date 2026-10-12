@@ -20,6 +20,7 @@ build/
 # Local ChromaDB / generated files
 *.chroma.json
 chroma_db/
+.ragspark_store/
 sample_legal_judgment.pdf
 
 # Agent / BMAD local tooling

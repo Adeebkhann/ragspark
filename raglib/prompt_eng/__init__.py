@@ -681,6 +681,19 @@ def _get_session_fallback_items() -> list[Any]:
     except Exception:
         pass
 
+    # If the Jupyter kernel was restarted and the user jumped straight to Step 6/7 without re-running Steps 1–5,
+    # automatically reload the most recently persisted VectorStore from `.ragspark_store` on disk!
+    try:
+        from pathlib import Path
+        from raglib import vectordb as vdb_mod
+
+        if Path(".ragspark_store/_last_active.txt").exists():
+            disk_store = vdb_mod.load()
+            if getattr(disk_store, "_chunks", None):
+                return list(disk_store._chunks)
+    except Exception:
+        pass
+
     return list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
 
 

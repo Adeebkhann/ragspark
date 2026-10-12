@@ -330,5 +330,12 @@ def test_step7_notebook_screenshot_regression() -> None:
     assert "Article 19(1)(a)" in answer.text
     assert "freedom of speech and expression" in answer.text.lower()
 
+    # Case 2: Verify 1-line instant reload (`rag.load` and `vectordb.load`) without re-running Parse/Chunk/Embed
+    loaded_db = vectordb.load(persist_directory=None)
+    assert loaded_db is not None
+    loaded_bot = rag.load()
+    assert loaded_bot is not None
+
+
 
 

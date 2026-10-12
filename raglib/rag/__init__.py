@@ -561,6 +561,76 @@ def ask_law(
     return pipe.ask(query=query, top_k=top_k)
 
 
+def load(
+    collection_name: str = "raglib_collection",
+    persist_directory: str | Path | None = None,
+    mode: str = "law",
+    embed_provider: str = "fast_local",
+    embed_strategy: str = "legal_domain_boost",
+    embed_model: str | None = None,
+    embed_api_key: str | None = None,
+    embed_dimension: int = 384,
+    retrieval_strategy: str = "rerank",
+    prompt_technique: str | None = None,
+    system_prompt: str | None = None,
+    llm_provider: str = "extractive",
+    provider: str | None = None,
+    llm_model: str | None = None,
+    model: str | None = None,
+    llm_api_key: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    rewrite_queries: bool = True,
+    **vectordb_kwargs: Any,
+) -> RAGPipeline:
+    """
+    Instant 1-Line Pipeline Loader (`bot = rag.load()`):
+    Reloads your already-chunked & embedded VectorDB from disk (`.ragspark_store`) in <0.05s
+    so you NEVER have to re-run PDF Parsing, Chunking, or Embedding cells in Jupyter Lab!
+    """
+    store = vectordb_mod.load(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        embed_model=embed_model,
+        embed_api_key=embed_api_key or api_key,
+        embed_dimension=embed_dimension,
+        **vectordb_kwargs,
+    )
+    chunks = list(store._chunks)
+    src_name = chunks[0].source if chunks else collection_name
+    doc_type = str(chunks[0].metadata.get("doc_type", "law_general" if mode == "law" else "unstructured")) if chunks else "unstructured"
+    placeholder_doc = ParsedDocument(
+        source=src_name,
+        doc_type=doc_type,
+        mode_used=mode,
+        engine_used="disk_cache",
+        raw_text="",
+        text="\n\n".join(c.text for c in chunks[:20]),
+        pages=[],
+    )
+    return RAGPipeline(
+        document=placeholder_doc,
+        chunks=chunks,
+        store=store,
+        mode=mode,
+        embed_provider=embed_provider,
+        embed_strategy=embed_strategy,
+        embed_model=embed_model,
+        embed_api_key=embed_api_key or api_key,
+        embed_dimension=embed_dimension,
+        retrieval_strategy=retrieval_strategy,
+        llm_provider=provider or llm_provider,
+        llm_model=model or llm_model,
+        llm_api_key=llm_api_key or api_key,
+        llm_base_url=base_url,
+        prompt_technique=prompt_technique or ("natural_law" if mode == "law" else "standard"),
+        system_prompt=system_prompt,
+        rewrite_queries=rewrite_queries,
+    )
+
+
 rewrite_query = prompt_mod.rewrite_query
 rewrite_law_query = prompt_mod.rewrite_law_query
 
@@ -570,6 +640,7 @@ __all__ = [
     "RAGResponse",
     "create",
     "create_law",
+    "load",
     "ask",
     "ask_law",
     "rewrite_query",

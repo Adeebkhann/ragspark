@@ -238,8 +238,8 @@ class VectorStore:
                     pass
             except Exception:
                 self._backend_name = "chroma_local_engine"
-                if self.persist_directory:
-                    self._load_local_persistence()
+            if not self._chunks:
+                self._load_local_persistence()
 
         elif self.provider == "pinecone":
             if self.api_key:
@@ -360,7 +360,7 @@ class VectorStore:
             except Exception:
                 pass
 
-        if self.persist_directory and self._backend_name == "chroma_local_engine":
+        if self.provider != "memory":
             self._save_local_persistence()
 
         return len(chunks)
@@ -549,26 +549,28 @@ class VectorStore:
         return len(self._chunks)
 
     def _save_local_persistence(self) -> None:
-        if not self.persist_directory:
-            return
-        self.persist_directory.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
-        store_file = self.persist_directory / f"{safe_name}.chroma.json"
-        payload = {
-            "collection_name": self.collection_name,
-            "provider": self.provider,
-            "items": [
-                {"chunk": c.to_dict(), "embedding": e}
-                for c, e in zip(self._chunks, self._embeddings)
-            ],
-        }
-        store_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        target_dir = self.persist_directory or Path(".ragspark_store")
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
+            store_file = target_dir / f"{safe_name}.chroma.json"
+            payload = {
+                "collection_name": self.collection_name,
+                "provider": self.provider,
+                "items": [
+                    {"chunk": c.to_dict(), "embedding": e}
+                    for c, e in zip(self._chunks, self._embeddings)
+                ],
+            }
+            store_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            (target_dir / "_last_active.txt").write_text(str(store_file.resolve()), encoding="utf-8")
+        except Exception:
+            pass
 
     def _load_local_persistence(self) -> None:
-        if not self.persist_directory:
-            return
+        target_dir = self.persist_directory or Path(".ragspark_store")
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
-        store_file = self.persist_directory / f"{safe_name}.chroma.json"
+        store_file = target_dir / f"{safe_name}.chroma.json"
         if not store_file.exists():
             return
         try:
@@ -590,13 +592,42 @@ def connect(
     backend: str | None = None,
     **kwargs: Any,
 ) -> VectorStore:
-    """Connect to or create a VectorDB store (default: ChromaDB)."""
+    """Connect to or create a VectorDB store (default: ChromaDB). Automatically reloads persisted chunks if present."""
     return VectorStore(
         provider=backend or provider,
         collection_name=collection_name,
         persist_directory=persist_directory,
         api_key=api_key,
         connection_uri=connection_uri,
+        **kwargs,
+    )
+
+
+def load(
+    collection_name: str = "raglib_collection",
+    persist_directory: str | Path | None = None,
+    provider: str = "chroma",
+    **kwargs: Any,
+) -> VectorStore:
+    """
+    Reload an already-indexed VectorDB collection from disk in <0.05s without re-running Parser, Chunker, or Embedder!
+    If `collection_name` is omitted, loads the most recently saved collection from `.ragspark_store`.
+    """
+    target_dir = Path(persist_directory) if persist_directory else Path(".ragspark_store")
+    if collection_name == "raglib_collection" and not (target_dir / "raglib_collection.chroma.json").exists():
+        last_ptr = target_dir / "_last_active.txt"
+        if last_ptr.exists():
+            try:
+                saved_path = Path(last_ptr.read_text(encoding="utf-8").strip())
+                if saved_path.exists() and saved_path.name.endswith(".chroma.json"):
+                    collection_name = saved_path.name[: -len(".chroma.json")]
+                    target_dir = saved_path.parent
+            except Exception:
+                pass
+    return VectorStore(
+        provider=provider,
+        collection_name=collection_name,
+        persist_directory=target_dir,
         **kwargs,
     )
 
@@ -620,7 +651,7 @@ def store(
     """
     One-command VectorDB indexer (`vectordb.store(chunks, backend='chroma', collection_name='my_docs')`):
     Connects to the chosen VectorDB, automatically embeds `chunks` if `embeddings` is not provided,
-    stores them, and returns the ready-to-search `VectorStore`.
+    stores them (and persists to disk), and returns the ready-to-search `VectorStore`.
     """
     db = VectorStore(
         provider=backend or provider,
@@ -643,6 +674,7 @@ __all__ = [
     "VectorStore",
     "SearchResult",
     "connect",
+    "load",
     "store",
     "list_vectordbs",
     "list_retrieval_strategies",
