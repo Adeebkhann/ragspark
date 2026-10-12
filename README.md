@@ -30,7 +30,7 @@ doc = parser.parse("notes.pdf")
 # 2. Chunk with 15+ strategies (recursive, semantic, sentence, token, hybrid...)
 chunks = chunker.chunk(doc, strategy="recursive", chunk_size=500, overlap=80)
 
-# 3. Store & search in ChromaDB, Pinecone, Qdrant, MongoDB, or In-Memory
+# 3. Store & search in ChromaDB, Pinecone, Qdrant, MongoDB, or In-Memory (Auto-persists to .ragspark_store!)
 db = vectordb.store(chunks, backend="chroma", collection_name="my_docs")
 hits = db.search("What are the key takeaways?", top_k=5)
 
@@ -38,17 +38,29 @@ hits = db.search("What are the key takeaways?", top_k=5)
 rewritten = prompt_eng.rewrite_query("tell me about attention")
 prompt = prompt_eng.build(hits, query=rewritten.rewritten_query, technique="standard")
 
-# 5. Generate natural, fluent sentence answers (Ollama, Gemini, OpenAI, Groq, or offline Extractive)
-answer = llm.generate(prompt, provider="extractive")
+# 5. Generate natural, fluent sentence answers (Supports AIza... & Vertex AI AQ.... keys, Ollama, OpenAI, Groq, or Extractive)
+answer = llm.generate(
+    prompt,
+    query="What are the key takeaways?",
+    provider="gemini",
+    model="gemini 3.8 flash",
+    api_key="YOUR_API_KEY",
+)
 print(answer.text)
 ```
 
-### Or Run the Entire Pipeline in 1 Line:
-```python
-from ragspark import rag
+### 💾 Instant `<0.05s` Reload in Jupyter Lab (No Need to Re-Run Cells!)
+Every time you index a PDF (`vectordb.store(...)`, `db.add(...)`, or `rag.create(...)`), `ragspark` automatically persists your chunks and embeddings to `./.ragspark_store/` on disk. Next time you open Jupyter Lab or restart your kernel, skip Steps 1–4 and reload in **1 line (`<0.05s`)**:
 
-bot = rag.create("notes.pdf", llm_provider="gemini", llm_api_key="YOUR_KEY")
-print(bot.ask("Explain the main architecture in simple sentences.").answer)
+```python
+from ragspark import vectordb, rag
+
+# Reload your VectorStore in 0.02s without re-parsing or re-embedding:
+db = vectordb.load()
+
+# Or reload the entire RAG Pipeline in 0.02s:
+bot = rag.load()
+print(bot.ask("Explain freedom of speech under Article 19(1)(a).").text)
 ```
 
 ---

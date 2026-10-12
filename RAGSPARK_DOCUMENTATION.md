@@ -7,20 +7,22 @@
 **`ragspark`** is an industry-grade, modular, laptop-friendly Python **Retrieval-Augmented Generation (RAG)** library built for **both general documents** (books, research papers, manuals, notes, PDFs) **and specialized legal documents** (the Constitution of India, Statutes, Acts, Judgments, and Contracts).
 
 ### Core Highlights:
-* **⚡ Ultra-Fast PDF Parsing (`< 0.5s`):** Uses C-level **PyMuPDF (`fitz`)** block extraction so 30–400+ page PDFs parse in milliseconds without freezing laptop CPU or RAM.
+* **⚡ Ultra-Fast Massive PDF Parsing (`< 0.5s`):** Uses C-level **PyMuPDF (`fitz`)** block extraction so 30–1,000+ page PDFs parse in milliseconds without freezing laptop CPU or RAM, plus automatic 100-chunk batching for cloud embeddings.
+* **💾 Automatic Disk Persistence (`.ragspark_store`) & `<0.05s` Jupyter Reload:** Automatically saves indexed chunks and embeddings to `./.ragspark_store/` on disk so you **never have to re-run PDF parsing/chunking/embedding cells** when you reopen Jupyter Lab—just call `db = vectordb.load()` or `bot = rag.load()` (or run `llm.generate(prompt, query=...)` directly!).
 * **🗣️ Natural Sentence Answers by Default (Conditional IRAC):** Generates fluent, ChatGPT-like sentence and paragraph explanations by default—and **automatically switches to 4-part IRAC format** (`Issue, Rule, Application, Conclusion`) **only when the user writes `"in IRAC"` in their query**.
 * **📖 Legal Story & Scenario Question Solver:** Understands real-life hypothetical stories (e.g., *"Ramesh was arrested and kept in lockup for 3 days without a magistrate..."*), identifies the characters (`actors`), maps the story to exact Constitutional Articles (`Article 22`, `Article 21`, `Article 19`), and answers the story directly in natural sentences.
 * **🔄 Built-In Query Rewriting (General + Law-Specialized):** Includes `rewrite_query()` for general RAG and `rewrite_law_query()` for translating everyday/story questions into statutory and Constitutional terminology.
 * **✂️ 10 Chunking Strategies + Combinations:** Single (`"recursive"`, `"legal_clause"`, `"semantic"`, etc.) or combined (`["legal_clause", "semantic"]` ensemble or `"legal_clause>sentence"` chain), supporting both `overlap=` and `chunk_overlap=`.
-* **🗄️ 1-Line Vector Indexing + 7 Retrieval Techniques:** Index and search in one line via `vectordb.store(chunks)` and `db.search("query")`, or customize across `"semantic"`, `"bm25"`, `"hybrid"`, `"rrf"`, `"mmr"`, `"rerank"`, and `"multi_query"`.
-* **💬 Clean, Customizable ChatGPT-Style UI (Web & Jupyter):** Renders rich Markdown, blockquotes, and citation pills in a clean Question & Answer chat window (`ui.launch(bot)` or `ui.notebook_chat(bot)`).
+* **🗄️ 1-Line Vector Indexing (`store` / `load`) + 7 Retrieval Techniques:** Index, reload, and search in one line via `vectordb.store(chunks)`, `vectordb.load()`, and `db.search("query")`, or customize across `"semantic"`, `"bm25"`, `"hybrid"`, `"rrf"`, `"mmr"`, `"rerank"`, and `"multi_query"`.
+* **🔑 Smart Multi-Runtime LLM Engine (`AIza...` & Vertex AI `AQ....` Keys):** Supports human-friendly model names (`"gemini 3.8 flash"`, `"claude sonnet 5.5"`, `"gpt-4o"`, `"llama3.2"`), both Google AI Studio (`AIza...`) and GCP Vertex AI Express (`AQ....`) keys, and auto-hydrates/re-ranks session chunks whenever `query="..."` is passed in `llm.generate(prompt, query="...")`.
+* **💬 Clean, Customizable ChatGPT-Style UI (Web & Jupyter):** Multi-threaded server (`ThreadingHTTPServer`) rendering rich Markdown, blockquotes, and citation pills in a clean Question & Answer chat window (`ui.launch(bot)` or `ui.notebook_chat(bot)`).
 
 ---
 
-## ⚡ 2. Quick Overview — All Simple Commands `ragspark` Can Do
+## ⚡ 2. Quick Overview — All 32 Commands Across 8 Modules
 
 ```python
-# 0. Import all 8 modules from `ragspark`
+# 0. Import all 8 modules from `ragspark` (or `raglib`)
 from ragspark import parser, chunker, embedder, vectordb, prompt_eng, llm, rag, ui
 
 # ─── A. SIMPLE GENERAL RAG COMMANDS (For Any PDF, Text, or Document) ───
@@ -29,12 +31,14 @@ chunks   = chunker.chunk(doc, strategy="recursive", chunk_size=700, overlap=80) 
 vectors  = embedder.embed(chunks, provider="fast_local", strategy="dense")            # 3. Embed chunks
 gen_rw   = prompt_eng.rewrite_query("How does photosynthesis work?", strategy="hyde") # 4. Rewrite general query
 q_vec    = embedder.embed_query(gen_rw, provider="fast_local", strategy="dense")      # 5. Embed query
-db       = vectordb.store(chunks, backend="chroma", collection_name="my_docs")        # 6a. 1-Line Auto-Embed & Store
-hits     = db.search("How does photosynthesis work?", strategy="hybrid", top_k=3)     # 6b. 1-Line Auto-Embed Search
-prompt   = prompt_eng.build("How does photosynthesis work?", hits)                    # 7. Build Prompt
-answer   = llm.generate(prompt, provider="extractive", model="extractive")            # 8. Generate Answer
-bot      = rag.create("notes.pdf", chunk_strategy="recursive", vectordb="chroma")     # 9. 1-Line General RAG
-res      = bot.ask("Summarize the key points.")                                       # 9b. Ask General Bot
+db       = vectordb.store(chunks, backend="chroma", collection_name="my_docs")        # 6a. 1-Line Auto-Embed, Store & Persist
+db_fast  = vectordb.load("my_docs")                                                   # 6b. 1-Line Instant Disk Reload (<0.05s)
+hits     = db.search("How does photosynthesis work?", strategy="hybrid", top_k=3)     # 6c. 1-Line Auto-Embed Search
+prompt   = prompt_eng.build(hits, query=gen_rw.rewritten_query, technique="standard") # 7. Build Prompt
+answer   = llm.generate(prompt, query="How does photosynthesis work?", provider="gemini", model="gemini 3.8 flash", api_key="...") # 8. Generate Answer
+bot      = rag.create("notes.pdf", chunk_strategy="recursive", vectordb="chroma")     # 9a. 1-Line General RAG
+bot_fast = rag.load("raglib_general")                                                 # 9b. 1-Line Instant Pipeline Reload (<0.05s)
+res      = bot.ask("Summarize the key points.")                                       # 9c. Ask General Bot
 server   = ui.launch(bot, title="My Study Bot", theme="dark", background=True)        # 10a. Launch Clean Web UI
 nb_srv   = ui.notebook_chat(bot, title="My Study Bot")                                # 10b. Launch Jupyter/Colab UI
 
@@ -45,7 +49,8 @@ law_vecs = embedder.embed(law_chks, strategy="legal_domain_boost")              
 law_rw   = prompt_eng.rewrite_law_query("Ramesh was arrested without warrant...")     # 4. Law & Story Query Rewriter
 law_hits = db.search(q_vec, query_text=law_rw, strategy="rerank", top_k=3)            # 5. 2-Stage Legal Reranker
 law_pmpt = prompt_eng.build_law(law_rw.original, law_hits, technique="natural_law")   # 6. Adaptive Law Prompt
-law_bot  = rag.create_law("constitution_of_india.pdf", retrieval_strategy="rerank")   # 7. 1-Line Law RAG Pipeline
+law_bot  = rag.create_law("constitution_of_india.pdf", retrieval_strategy="rerank")   # 7a. 1-Line Law RAG Pipeline
+law_load = rag.load("raglib_law", mode="law")                                         # 7b. Instant Law Pipeline Reload (<0.05s)
 ans_sent = law_bot.ask("What is Article 21?")                                         # 8a. Natural Sentence Answer
 ans_stry = law_bot.ask("Ramesh was detained for 3 days without a magistrate. Advise.")# 8b. Story Scenario Answer
 ans_irac = law_bot.ask("Explain Article 19 in IRAC format")                           # 8c. Auto IRAC Answer
@@ -94,14 +99,15 @@ Use these commands for **any general document** (books, research papers, manuals
 
 ---
 
-### 🗄️ 4. `ragspark.vectordb` — ChromaDB Default, 1-Line `store()`, & 7 Retrieval Techniques
+### 🗄️ 4. `ragspark.vectordb` — ChromaDB Default, 1-Line `store()` / `load()`, & 7 Retrieval Techniques
 **Import:** `from ragspark import vectordb`
 
 | Command | Details (Databases & Retrieval Techniques) | How It Works |
 | :--- | :--- | :--- |
-| `db = vectordb.store(chunks, backend="chroma", collection_name="my_docs")` | **1-Line Vector Indexer:** Connects to the database, automatically embeds `chunks` if `embeddings` is omitted, stores them, and returns `VectorStore`. | Supports `backend=` or `provider=` across `"chroma"` (default), `"pinecone"`, `"mongodb"`, `"qdrant"`, and `"memory"`. |
-| `db = vectordb.connect("chroma", collection_name="docs")` | Connects to an existing or new VectorDB collection. | Initializes ChromaDB (in-memory or persistent on disk via `persist_directory="./chroma_db"`) or connects to external cloud vector stores. |
-| `db.add(chunks, vectors)` *(or `db.add(chunks)`)* | Stores chunks, embeddings, page numbers, and `chunk_strategy` tags in the database. | Upserts documents, vectors, and metadata into the active collection (auto-embedding if `vectors` is omitted). |
+| `db = vectordb.store(chunks, backend="chroma", collection_name="my_docs")` | **1-Line Vector Indexer & Disk Persister:** Connects to the database, automatically embeds `chunks` if `embeddings` is omitted, stores them, and persists to `./.ragspark_store/` on disk. | Supports `backend=` or `provider=` across `"chroma"` (default), `"pinecone"`, `"mongodb"`, `"qdrant"`, and `"memory"`. |
+| `db = vectordb.load(collection_name="my_docs")` | **1-Line Instant Disk Loader (`<0.05s`):** Reloads an already-indexed VectorStore from `./.ragspark_store/` on disk without re-running Parser, Chunker, or Embedder! | If `collection_name` is omitted (`vectordb.load()`), automatically loads the most recently saved collection (`_last_active.txt`). |
+| `db = vectordb.connect("chroma", collection_name="docs")` | Connects to an existing or new VectorDB collection (auto-reloads persisted chunks if present). | Initializes ChromaDB (with safe NumPy array reload) or connects to external cloud vector stores. |
+| `db.add(chunks, vectors)` *(or `db.add(chunks)`)* | Stores chunks, embeddings, page numbers, and `chunk_strategy` tags in the database and updates `.ragspark_store`. | Upserts documents, vectors, and metadata into the active collection (auto-embedding if `vectors` is omitted). |
 | `hits = db.search("Your question?", strategy="hybrid", top_k=5)`<br>*(or `db.search(q_vec, query_text=q, ...)`)* | Searches the DB using a direct query string OR pre-computed query vector across **7 Retrieval Techniques**:<br>1. `"semantic"` (dense cosine)<br>2. `"bm25"` / `"keyword"` (exact lexical)<br>3. `"hybrid"` (dense + BM25)<br>4. `"rrf"` (Reciprocal Rank Fusion)<br>5. `"mmr"` (Maximal Marginal Relevance)<br>6. `"rerank"` (2-stage cross-feature reranker)<br>7. `"multi_query"` (query expansion + RRF). | Auto-embeds string queries using the store's configured embedding strategy, computes candidate scores (with optional `chunk_strategy_filter`), and returns ranked `SearchResult` objects (`hit.chunk.text`, `hit.score`). |
 
 ---
@@ -112,7 +118,7 @@ Use these commands for **any general document** (books, research papers, manuals
 | Command | Details (Parameters & Techniques) | How It Works |
 | :--- | :--- | :--- |
 | `rw = prompt_eng.rewrite_query("Can you tell me...", strategy="auto")` | **General Query Rewriter:** Cleans and expands conversational queries.<br>**Strategies:** `"auto"`, `"hyde"` (Hypothetical Document Embeddings), `"step_back"`, `"sub_queries"`. | Strips conversational filler, extracts core domain keywords, generates sub-queries (`rw.sub_queries`), and detects whether the user asked a story (`rw.is_story`) or requested IRAC (`rw.wants_irac`). |
-| `prompt = prompt_eng.build(hits, query=rw.rewritten_query, technique="standard")` | Builds a grounded `BuiltPrompt` from retrieved `hits` (accepts `(query, hits)` or `(hits, query=...)`).<br>**Techniques:** `"standard"`, `"cot"`, `"citation_strict"`, `"few_shot"`, `"concise"`. | Formats retrieved chunks with `[Page X]` citations and instructs the LLM to answer in natural, flowing sentences (switching to IRAC only if the user's query asks for IRAC). |
+| `prompt = prompt_eng.build(hits, query=rw.rewritten_query, technique="standard")` | Builds a grounded `BuiltPrompt` from retrieved `hits`, `chunks`, `db`, `doc`, or `bot` (or auto-recovers active session chunks if omitted).<br>**Techniques:** `"standard"`, `"cot"`, `"citation_strict"`, `"few_shot"`, `"concise"`. | Formats retrieved chunks with `[Page X]` citations and instructs the LLM to answer in natural, flowing sentences (switching to IRAC only if the user's query asks for IRAC). |
 
 ---
 
@@ -121,17 +127,18 @@ Use these commands for **any general document** (books, research papers, manuals
 
 | Command | Details (Supported Runtimes & Models) | How It Works |
 | :--- | :--- | :--- |
-| `answer = llm.generate(prompt, provider="extractive", model="extractive")` | **Offline Mode:** Generates natural, fluent sentence answers without any API key.<br>**Output:** `answer` (works with both `print(answer)` and `print(answer.text)`). | Strips chunk debug headers, cleans prose, and synthesizes natural flowing sentences citing `[Section]` and `(Page X)`. Automatically formats in IRAC if `"irac"` is in the query. |
-| `answer = llm.generate(prompt, provider="gemini", model="gemini 3.8 flash", api_key="...")` | **Cloud API / Local Ollama Mode:**<br>**Providers:** `"gemini"`, `"anthropic"` (`"claude sonnet 5.5"`), `"openai"` (`"gpt 4o"`), `"groq"`, `"openrouter"`, `"ollama"` (`"llama 3.2"`). | Resolves human-friendly model names (`"gemini 3.8 flash"` $\rightarrow$ `gemini-3.8-flash`), calls the provider's API or local Ollama server, and falls back safely if offline. |
+| `answer = llm.generate(prompt, provider="extractive", model="extractive")` | **Offline Mode:** Generates natural, fluent sentence answers without any API key.<br>**Output:** `answer` (works with both `print(answer)` and `print(answer.text)`). | Selects query-relevant sentences inside retrieved chunks, cleans prose, and synthesizes natural flowing sentences citing `[Section]` and `(Page X)`. Automatically formats in IRAC if `"irac"` is in the query. |
+| `answer = llm.generate(prompt, query="...", provider="gemini", model="gemini 3.8 flash", api_key="...")` | **Cloud API / Local Ollama Mode:**<br>**Providers:** `"gemini"` (supports both AI Studio `AIza...` & Vertex AI Express `AQ....` keys), `"anthropic"` (`"claude sonnet 5.5"`), `"openai"` (`"gpt 4o"`), `"groq"`, `"openrouter"`, `"ollama"` (`"llama 3.2"`). | Resolves human-friendly model names (`"gemini 3.8 flash"` $\rightarrow$ `gemini-2.5-flash` with auto-fallback), re-ranks session/persisted chunks when `query=` is passed in Step 7, and fast-fails invalid auth hosts. |
 
 ---
 
-### 🚀 7. `ragspark.rag` — All-in-One General RAG Pipeline
+### 🚀 7. `ragspark.rag` — All-in-One General RAG Pipeline (`create` & `load`)
 **Import:** `from ragspark import rag`
 
 | Command | Details | How It Works |
 | :--- | :--- | :--- |
-| `bot = rag.create("notes.pdf", chunk_strategy="recursive", retrieval_strategy="hybrid", vectordb="chroma", llm_provider="extractive", llm_model="extractive", llm_api_key="...")` | Builds the complete general RAG pipeline in a single command (`rewrite_queries=True` by default). | Automatically runs `parser.parse` $\rightarrow$ `chunker.chunk` $\rightarrow$ `embedder.embed` $\rightarrow$ `vectordb.connect` and returns a stateful `RAGPipeline` (`bot`). |
+| `bot = rag.create("notes.pdf", chunk_strategy="recursive", retrieval_strategy="hybrid", vectordb="chroma", llm_provider="extractive", llm_model="extractive", llm_api_key="...")` | Builds the complete general RAG pipeline in a single command (`rewrite_queries=True` by default) and persists to `./.ragspark_store/`. | Automatically runs `parser.parse` $\rightarrow$ `chunker.chunk` $\rightarrow$ `embedder.embed` $\rightarrow$ `vectordb.connect` and returns a stateful `RAGPipeline` (`bot`). |
+| `bot = rag.load(collection_name="raglib_general")` | **1-Line Instant Pipeline Loader (`<0.05s`):** Reloads your already-indexed RAG pipeline from `./.ragspark_store/` on disk without re-parsing or re-embedding! | Loads persisted chunks and vectors from `.ragspark_store` so you never have to re-run early notebook cells in Jupyter Lab. |
 | `res = bot.ask("Summarize the document.")` | Rewrites the query, retrieves top chunks, and generates a natural sentence answer (`res.answer`, `res.rewritten_query`, `res.sources`). | Runs automatic query rewriting + hybrid retrieval + adaptive prompt building + LLM generation. |
 | `report = bot.compare_retrieval("Your question?", top_k=3)` | Side-by-side retrieval benchmark across `"semantic"`, `"bm25"`, `"hybrid"`, `"rrf"`, `"mmr"`, and `"rerank"`. | Runs all 6 retrieval strategies on the same query and returns a comparison dictionary of top hits and scores. |
 
@@ -222,4 +229,47 @@ server = ui.launch(
     background=True
 )
 ```
+
+---
+
+## 💾 5. Massive PDFs & Instant `<0.05s` Jupyter Lab Persistence (`.ragspark_store`)
+
+### 1. Where Are Chunks & Embeddings Stored?
+Whenever you index chunks (`vectordb.store(...)`, `db.add(...)`, `rag.create(...)`, or `rag.create_law(...)`), `ragspark` automatically saves a persistent disk snapshot inside your working directory:
+* **Default Disk Path:** `./.ragspark_store/{collection_name}.chroma.json` (plus `./.ragspark_store/_last_active.txt` pointing to your latest active collection).
+* **Custom Disk Path:** Pass `persist_directory="./my_chroma_db"` to store both ChromaDB's native SQLite/HNSW index and `.chroma.json` in a custom directory.
+
+### 2. How to Use Jupyter Lab WITHOUT Re-Running Every Cell Every Time
+You only need to run **Steps 1–4 (Parse $\rightarrow$ Chunk $\rightarrow$ Embed $\rightarrow$ Store) ONCE** when you first index a massive PDF (e.g., a 400+ page Constitution or textbook).
+
+Next time you open Jupyter Lab or restart your kernel, choose any of these **3 zero-re-run workflows**:
+
+```python
+from ragspark import vectordb, prompt_eng, llm, rag
+
+# ✅ Option 1: Reload the entire RAG Pipeline in 1 line (<0.05s)
+bot = rag.load()  # Automatically loads your latest collection from .ragspark_store
+print(bot.ask("Explain freedom of speech and expression under Article 19(1)(a).").text)
+
+# ✅ Option 2: Reload your VectorStore in 1 line (<0.05s) and search/generate
+db = vectordb.load()
+hits = db.search("Explain freedom of speech and expression under Article 19(1)(a).", top_k=5)
+prompt = prompt_eng.build_law(hits, query="Explain freedom of speech and expression under Article 19(1)(a).")
+answer = llm.generate(prompt, provider="gemini", model="gemini 3.8 flash", api_key="YOUR_KEY")
+print(answer.text)
+
+# ✅ Option 3: Run Step 6 & Step 7 directly!
+# Even if you jump straight to Step 6/7 after a kernel restart, ragspark automatically reloads
+# `.ragspark_store/_last_active.txt` from disk and ranks the matching chunks for `query`!
+prompt = prompt_eng.build(technique="standard")
+answer = llm.generate(
+    prompt,
+    query="Explain freedom of speech and expression under Article 19(1)(a).",
+    provider="gemini",
+    model="gemini 3.8 flash",
+    api_key="YOUR_KEY"
+)
+print(answer.text)
+```
+
 
