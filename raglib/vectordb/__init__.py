@@ -211,12 +211,16 @@ class VectorStore:
                 self._backend_name = "chromadb_native"
                 try:
                     existing = self._native_backend.get(include=["documents", "embeddings", "metadatas"])
-                    ids = existing.get("ids") or []
-                    docs = existing.get("documents") or []
-                    embs = existing.get("embeddings") or []
-                    metas = existing.get("metadatas") or []
+                    raw_ids = existing.get("ids")
+                    raw_docs = existing.get("documents")
+                    raw_embs = existing.get("embeddings")
+                    raw_metas = existing.get("metadatas")
+                    ids = list(raw_ids) if raw_ids is not None else []
+                    docs = list(raw_docs) if raw_docs is not None else []
+                    embs = list(raw_embs) if raw_embs is not None else []
+                    metas = list(raw_metas) if raw_metas is not None else []
                     for idx_c, (cid, doc_txt, emb_vec) in enumerate(zip(ids, docs, embs)):
-                        meta = metas[idx_c] if idx_c < len(metas) and metas[idx_c] else {}
+                        meta = metas[idx_c] if idx_c < len(metas) and metas[idx_c] is not None else {}
                         self._chunks.append(
                             Chunk(
                                 id=str(cid),
@@ -548,7 +552,8 @@ class VectorStore:
         if not self.persist_directory:
             return
         self.persist_directory.mkdir(parents=True, exist_ok=True)
-        store_file = self.persist_directory / f"{self.collection_name}.chroma.json"
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
+        store_file = self.persist_directory / f"{safe_name}.chroma.json"
         payload = {
             "collection_name": self.collection_name,
             "provider": self.provider,
@@ -562,7 +567,8 @@ class VectorStore:
     def _load_local_persistence(self) -> None:
         if not self.persist_directory:
             return
-        store_file = self.persist_directory / f"{self.collection_name}.chroma.json"
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
+        store_file = self.persist_directory / f"{safe_name}.chroma.json"
         if not store_file.exists():
             return
         try:

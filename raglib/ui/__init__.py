@@ -14,11 +14,12 @@ Usage:
 
 from __future__ import annotations
 
+import html
 import json
 import socket
 import threading
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -86,14 +87,16 @@ def _render_chatbot_html(config: dict[str, Any]) -> str:
     if config.get("accent_color"):
         palette["accent"] = config["accent_color"]
 
-    title = config.get("title", "raglib Chatbot")
-    subtitle = config.get("subtitle", "Powered by raglib RAG Pipeline")
-    bot_name = config.get("bot_name", "AI Assistant")
-    welcome_message = config.get("welcome_message", "Hello! Ask me any question about your document.")
-    placeholder = config.get("placeholder", "Type your question here and press Enter...")
+    title = html.escape(str(config.get("title", "raglib Chatbot")), quote=True)
+    subtitle = html.escape(str(config.get("subtitle", "Powered by raglib RAG Pipeline")), quote=True)
+    bot_name = html.escape(str(config.get("bot_name", "AI Assistant")), quote=True)
+    welcome_message = html.escape(
+        str(config.get("welcome_message", "Hello! Ask me any question about your document.")), quote=True
+    )
+    placeholder = html.escape(str(config.get("placeholder", "Type your question here and press Enter...")), quote=True)
     show_sources = "true" if config.get("show_sources", False) else "false"
     allow_ui_edit = config.get("allow_ui_edit", True)
-    custom_css = config.get("custom_css", "")
+    custom_css = str(config.get("custom_css", "")).replace("</style>", "")
 
     customize_btn_html = (
         '<button class="icon-btn" onclick="toggleSettings()" title="Customize UI">🎨 Edit UI</button>'
@@ -650,7 +653,7 @@ def launch(
                 self.send_response(404)
                 self.end_headers()
                 return
-            length = int(self.headers.get("Content-Length", "0"))
+            length = min(int(self.headers.get("Content-Length", "0")), 10 * 1024 * 1024)
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             try:
                 query = body.get("query", "").strip()
@@ -668,7 +671,7 @@ def launch(
                 self.wfile.write(err)
 
     actual_port = _find_available_port(port)
-    server = HTTPServer((host, actual_port), _CleanChatHandler)
+    server = ThreadingHTTPServer((host, actual_port), _CleanChatHandler)
     url = f"http://{host}:{actual_port}"
     print(f"🚀 Clean Chatbot UI running at: {url}")
     if open_browser:

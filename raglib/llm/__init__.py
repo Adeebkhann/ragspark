@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -241,10 +242,17 @@ def generate(
                 if len(session_pool) > len(raw_pool):
                     raw_pool = session_pool
 
-            # Append built-in constitutional reference chunks at the tail of the pool so if the user asks
-            # a specific Constitutional Article question (like Article 19(1)(a)) and their active test snippet
-            # didn't include that page, it still ranks and answers accurately!
-            raw_pool = raw_pool + list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
+            # Only append built-in constitutional fallback chunks if raw_pool is empty OR if the user explicitly
+            # asks about a Constitutional Article (e.g. "Article 19(1)(a)") that isn't present in raw_pool
+            if not raw_pool:
+                raw_pool = list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
+            elif re.search(r"\barticle\s+\d+", query_text, re.IGNORECASE):
+                pool_text_low = " ".join(
+                    (c.text if hasattr(c, "text") else str(c)).lower() for c in raw_pool[:50]
+                )
+                art_match = re.search(r"\barticle\s+(\d+)", query_text, re.IGNORECASE)
+                if art_match and f"article {art_match.group(1)}" not in pool_text_low:
+                    raw_pool = raw_pool + list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
 
             if raw_pool:
                 rw_q = rewrite_law_query(query_text)
@@ -421,18 +429,19 @@ def _call_gemini(
             candidate_models.append(fb)
 
     last_err: Exception | None = None
+    dead_hosts: set[str] = set()
     for cand in candidate_models:
         clean_cand = cand.replace("models/", "")
         # Support both Google AI Studio keys (AIza...) and GCP Vertex AI Express / Service Account keys (AQ....)
         endpoints = (
             [
-                f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_cand}:generateContent?key={key}",
-                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_cand}:generateContent?key={key}",
+                ("aiplatform", f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_cand}:generateContent?key={key}"),
+                ("generativelanguage", f"https://generativelanguage.googleapis.com/v1beta/models/{clean_cand}:generateContent?key={key}"),
             ]
             if key.startswith("AQ.")
             else [
-                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_cand}:generateContent?key={key}",
-                f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_cand}:generateContent?key={key}",
+                ("generativelanguage", f"https://generativelanguage.googleapis.com/v1beta/models/{clean_cand}:generateContent?key={key}"),
+                ("aiplatform", f"https://aiplatform.googleapis.com/v1/publishers/google/models/{clean_cand}:generateContent?key={key}"),
             ]
         )
         payload = {
@@ -440,14 +449,16 @@ def _call_gemini(
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": temperature},
         }
-        for url in endpoints:
+        for host_tag, url in endpoints:
+            if host_tag in dead_hosts:
+                continue
             req = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             try:
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with urllib.request.urlopen(req, timeout=20) as resp:
                     data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
                     candidates = data.get("candidates", [])
                     if candidates:
@@ -455,8 +466,15 @@ def _call_gemini(
                         text_out = "".join(p.get("text", "") for p in parts).strip()
                         if text_out:
                             return text_out
+            except urllib.error.HTTPError as http_exc:
+                last_err = http_exc
+                # If the endpoint rejected the API key / auth (400/401/403), don't retry 3 more models on the same host
+                if http_exc.code in (400, 401, 403):
+                    dead_hosts.add(host_tag)
+                continue
             except Exception as exc:
                 last_err = exc
+                dead_hosts.add(host_tag)
                 continue
     if last_err:
         raise last_err

@@ -233,15 +233,21 @@ class SmartEmbedder:
             raise ValueError("Gemini API key required. Pass `api_key='...'` or set GEMINI_API_KEY environment variable.")
         model_path = model if model.startswith("models/") else f"models/{model}"
         url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:batchEmbedContents?key={key}"
-        requests_list = [
-            {"model": model_path, "content": {"parts": [{"text": t}]}}
-            for t in texts
-        ]
-        payload = json.dumps({"requests": requests_list}).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return [item["values"] for item in data.get("embeddings", [])]
+        all_vectors: list[list[float]] = []
+        # Google Gemini batchEmbedContents allows at most 100 texts per batch request
+        batch_size = 100
+        for start in range(0, len(texts), batch_size):
+            batch_texts = texts[start : start + batch_size]
+            requests_list = [
+                {"model": model_path, "content": {"parts": [{"text": t}]}}
+                for t in batch_texts
+            ]
+            payload = json.dumps({"requests": requests_list}).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                all_vectors.extend(item["values"] for item in data.get("embeddings", []))
+        return all_vectors
 
     def _embed_openai(self, texts: list[str], model: str, api_key: str | None, base_url: str | None) -> list[list[float]]:
         key = api_key or os.environ.get("OPENAI_API_KEY")
