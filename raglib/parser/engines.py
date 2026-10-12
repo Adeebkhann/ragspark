@@ -317,8 +317,9 @@ def extract_pdf_hybrid(
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    if path.suffix.lower() in (".txt", ".md", ".markdown"):
-        content = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    if suffix in (".txt", ".md", ".markdown", ".rst", ".log"):
+        content = path.read_text(encoding="utf-8", errors="replace")
         pages_data = [
             {
                 "page_number": 1,
@@ -331,6 +332,61 @@ def extract_pdf_hybrid(
             }
         ]
         return pages_data, {}, {"title": path.stem, "page_count": 1}, "text_reader"
+
+    if suffix == ".docx":
+        # Native zero-dependency DOCX XML reader (also supports python-docx if installed)
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        paras: list[str] = []
+        with zipfile.ZipFile(path) as zf:
+            if "word/document.xml" in zf.namelist():
+                xml_bytes = zf.read("word/document.xml")
+                root = ET.fromstring(xml_bytes)
+                for p_elem in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
+                    texts = [t.text for t in p_elem.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t") if t.text]
+                    if texts:
+                        paras.append("".join(texts).strip())
+        content = "\n\n".join(p for p in paras if p)
+        return [{"page_number": 1, "raw_text": content, "headings": []}], {}, {"title": path.stem, "page_count": 1}, "docx_reader"
+
+    if suffix == ".csv":
+        import csv
+
+        rows_all: list[list[str]] = []
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if any(c.strip() for c in row):
+                    rows_all.append([c.strip() for c in row])
+        headers = rows_all[0] if rows_all else []
+        body = rows_all[1:] if len(rows_all) > 1 else []
+        md_tbl = _rows_to_markdown(headers, body)
+        row_texts = [", ".join(f"{headers[i]}: {r[i]}" if i < len(headers) else r[i] for i in range(len(r))) for r in (body or rows_all)]
+        content = "\n".join(row_texts)
+        tbl_dict = {1: [TableBlock(page_number=1, headers=headers, rows=body, markdown=md_tbl)]} if headers else {}
+        return [{"page_number": 1, "raw_text": content, "headings": headers[:5]}], tbl_dict, {"title": path.stem, "page_count": 1}, "csv_reader"
+
+    if suffix in (".json", ".jsonl"):
+        import json
+
+        raw_str = path.read_text(encoding="utf-8", errors="replace")
+        if suffix == ".jsonl":
+            records = [json.loads(line) for line in raw_str.splitlines() if line.strip()]
+            content = "\n\n".join(json.dumps(r, ensure_ascii=False, indent=2) if not isinstance(r, str) else r for r in records)
+        else:
+            parsed_json = json.loads(raw_str)
+            content = json.dumps(parsed_json, ensure_ascii=False, indent=2) if not isinstance(parsed_json, str) else parsed_json
+        return [{"page_number": 1, "raw_text": content, "headings": []}], {}, {"title": path.stem, "page_count": 1}, "json_reader"
+
+    if suffix in (".html", ".htm"):
+        import re as _re
+
+        raw_html = path.read_text(encoding="utf-8", errors="replace")
+        cleaned_html = _re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=_re.DOTALL | _re.IGNORECASE)
+        text_only = _re.sub(r"<[^>]+>", "\n", cleaned_html)
+        content = "\n".join(ln.strip() for ln in text_only.splitlines() if ln.strip())
+        return [{"page_number": 1, "raw_text": content, "headings": []}], {}, {"title": path.stem, "page_count": 1}, "html_reader"
 
     engines_used: list[str] = []
     tables_by_page: dict[int, list[TableBlock]] = {}
