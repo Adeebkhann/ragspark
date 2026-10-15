@@ -1,4 +1,4 @@
-"""Core orchestration for `raglib.parser` — uniting Unstructured PDF extraction and Legal Regex Intelligence."""
+"""Core orchestration for `ragspark.parser` — uniting Unstructured PDF extraction and Legal Regex Intelligence."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from raglib.parser.cleaner import clean_page_text, detect_repeating_headers_footers
-from raglib.parser.engines import extract_pdf_hybrid
-from raglib.parser.legal_regex import (
+from ragspark.parser.cleaner import clean_page_text, detect_repeating_headers_footers
+from ragspark.parser.engines import extract_pdf_hybrid
+from ragspark.parser.legal_regex import (
     clear_custom_regexes,
     detect_legal_document_type,
     extract_legal_citations,
@@ -19,13 +19,13 @@ from raglib.parser.legal_regex import (
     register_custom_regex,
     run_custom_regexes,
 )
-from raglib.parser.models import PageBlock, ParsedDocument, TableBlock
+from ragspark.parser.models import PageBlock, ParsedDocument, TableBlock
 
 
 class SmartParser:
     """
     Unified Smart Parser for Unstructured PDFs & Legal Documents.
-    Accessible directly via `from raglib import parser`.
+    Accessible directly via `from ragspark import parser`.
     """
 
     def parse(
@@ -66,6 +66,17 @@ class SmartParser:
             )
 
         path = Path(source)
+        if path.suffix.lower() != ".pdf" and path.exists():
+            text_content = path.read_text(encoding="utf-8", errors="ignore")
+            parsed = self.parse_text(
+                text=text_content,
+                mode=mode,
+                unwrap_lines=unwrap_lines,
+                custom_regexes=custom_regexes,
+            )
+            parsed.source = str(path)
+            return parsed
+
         pages_raw_data, tables_by_page, doc_meta, engine_used = extract_pdf_hybrid(
             path, extract_tables=extract_tables, ocr=ocr, api_key=api_key
         )
@@ -286,7 +297,7 @@ class SmartParser:
 
 _LAST_PARSED_DOC: ParsedDocument | None = None
 
-# Singleton instance backing `from raglib import parser`
+# Singleton instance backing `from ragspark import parser`
 default_parser = SmartParser()
 
 

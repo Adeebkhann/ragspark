@@ -1,5 +1,5 @@
 """
-`raglib.vectordb` — Production Multi-Backend VectorDB & Multi-Strategy Retrieval Engine.
+`ragspark.vectordb` — Production Multi-Backend VectorDB & Multi-Strategy Retrieval Engine.
 
 Supported VectorDB Providers (`provider=`):
   - "chroma"   (Default: ChromaDB native or persistent local Chroma-compatible engine)
@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from raglib.chunker import Chunk
+from ragspark.chunker import Chunk
 
 AVAILABLE_VECTORDBS = ("chroma", "pinecone", "mongodb", "qdrant", "memory")
 
@@ -285,7 +285,7 @@ class VectorStore:
         if not chunks:
             return 0
         if embeddings is None:
-            from raglib import embedder as embedder_mod
+            from ragspark import embedder as embedder_mod
 
             dim = len(self._embeddings[0]) if self._embeddings else self.embed_dimension
             embeddings = embedder_mod.embed(
@@ -400,7 +400,7 @@ class VectorStore:
             query_text = query
 
         if query_embedding is None:
-            from raglib import embedder as embedder_mod
+            from ragspark import embedder as embedder_mod
 
             dim = len(self._embeddings[0]) if self._embeddings else self.embed_dimension
             query_embedding = embedder_mod.embed_query(
@@ -540,6 +540,27 @@ class VectorStore:
                 )
             )
         return results
+
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        alpha: float = 0.65,
+    ) -> list[SearchResult]:
+        """
+        1-Line Hybrid Search combining Dense Semantic Vectors with Exact BM25 Keyword Search.
+
+        Args:
+            query: The search query string.
+            top_k: Number of top results to return.
+            alpha: Weight balancing factor (1.0 = pure vector, 0.0 = pure BM25 keyword, default=0.65).
+        """
+        return self.search(
+            query=query,
+            top_k=top_k,
+            strategy="hybrid",
+            hybrid_alpha=alpha,
+        )
 
     def list_indexed_strategies(self) -> list[str]:
         """Return the distinct chunking strategies currently stored in this VectorDB collection."""

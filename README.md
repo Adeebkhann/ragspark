@@ -1,8 +1,12 @@
-# ⚡ `ragspark` — Unified One-Command RAG & Legal AI Pipeline Library
+# ⚡ `ragspark` — Unified One-Command Industry RAG Pipeline Library
 
-**`ragspark`** is an all-in-one, student- and developer-friendly Python library that turns every stage of a Retrieval-Augmented Generation (RAG) system into a **single one-line command**—from smart PDF parsing and multi-strategy chunking to vector indexing, automatic query rewriting, LLM grounding, and a built-in ChatGPT-style Web & Jupyter UI.
+[![PyPI version](https://img.shields.io/badge/pypi-v0.3.0-blue.svg)](https://pypi.org/project/ragspark/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> 💡 **Backwards-Compatible Imports:** Both `from ragspark import ...` and `from raglib import ...` work out of the box!
+**`ragspark`** is an enterprise-ready, developer-friendly Python library that collapses the entire Retrieval-Augmented Generation (RAG) stack into **clean 1-line commands**. From multi-format ingestion with 4-layer OCR fallbacks and 15+ chunking strategies, to hybrid BM25+vector search, flash re-ranking, multilingual support, multi-turn chat memory, and sentence-level evidence citations.
+
+Works out of the box across any industry domain: Finance, Tech, Healthcare, E-Commerce, Legal, and Customer Support.
 
 ---
 
@@ -12,106 +16,210 @@
 pip install ragspark
 ```
 
-To install with all optional vector database, embedding, and LLM providers:
+To install with all vector database, OCR, and LLM backends:
 ```bash
 pip install "ragspark[full]"
 ```
 
 ---
 
-## 🚀 1-Line Quickstart (General RAG)
+## 🚀 1-Minute Quickstart
 
 ```python
-from ragspark import parser, chunker, vectordb, prompt_eng, llm, rag, ui
+import ragspark
 
-# 1. Parse any PDF, Markdown, or inline string
-doc = parser.parse("notes.pdf")
+# 1. Spin up an entire RAG pipeline from any PDF, Word doc, Markdown, CSV, or JSON
+bot = ragspark.rag.create("annual_report.pdf")
 
-# 2. Chunk with 15+ strategies (recursive, semantic, sentence, token, hybrid...)
-chunks = chunker.chunk(doc, strategy="recursive", chunk_size=500, overlap=80)
-
-# 3. Store & search in ChromaDB, Pinecone, Qdrant, MongoDB, or In-Memory (Auto-persists to .ragspark_store!)
-db = vectordb.store(chunks, backend="chroma", collection_name="my_docs")
-hits = db.search("What are the key takeaways?", top_k=5)
-
-# 4. Rewrite conversational queries & build grounded prompts
-rewritten = prompt_eng.rewrite_query("tell me about attention")
-prompt = prompt_eng.build(hits, query=rewritten.rewritten_query, technique="standard")
-
-# 5. Generate natural, fluent sentence answers (Supports AIza... & Vertex AI AQ.... keys, Ollama, OpenAI, Groq, or Extractive)
-answer = llm.generate(
-    prompt,
-    query="What are the key takeaways?",
-    provider="gemini",
-    model="gemini 3.8 flash",
-    api_key="YOUR_API_KEY",
-)
-print(answer.text)
-```
-
-### 💾 Instant `<0.05s` Reload in Jupyter Lab (No Need to Re-Run Cells!)
-Every time you index a PDF (`vectordb.store(...)`, `db.add(...)`, or `rag.create(...)`), `ragspark` automatically persists your chunks and embeddings to `./.ragspark_store/` on disk. Next time you open Jupyter Lab or restart your kernel, skip Steps 1–4 and reload in **1 line (`<0.05s`)**:
-
-```python
-from ragspark import vectordb, rag
-
-# Reload your VectorStore in 0.02s without re-parsing or re-embedding:
-db = vectordb.load()
-
-# Or reload the entire RAG Pipeline in 0.02s:
-bot = rag.load()
-print(bot.ask("Explain freedom of speech under Article 19(1)(a).").text)
-```
-
----
-
-## ⚖️ Specialized Law & Constitutional RAG Engine
-
-`ragspark` includes a dedicated legal intelligence pipeline for Statutes, Constitutions, Judgments, and Contracts:
-- **Legal Hierarchy Parser & Chunker**: Preserves `Part > Chapter > Article > Clause > Proviso` boundaries without splitting mid-clause.
-- **Story / Scenario Legal Solver**: Automatically detects real-world story/hypothetical questions (e.g., *"Ramesh was arrested by police and not produced before a magistrate for 4 days..."*) and maps the facts to exact Constitutional Articles (`Article 22(2)`, `Article 21`, `Article 32`).
-- **Natural Sentences by Default + On-Demand IRAC**: Generates clear, fluent legal prose by default, and automatically switches to structured **IRAC (`1. ISSUE`, `2. RULE`, `3. APPLICATION`, `4. CONCLUSION`)** whenever the user includes `"IRAC"` in their query.
-
-```python
-from ragspark import rag
-
-law_bot = rag.create_law("constitution_of_india.pdf")
-
-# 1. Story / Scenario Question -> Natural Legal Prose + Exact Article Citations
-res = law_bot.ask("Ramesh ran a newspaper and the government banned it for criticizing a minister. Advise Ramesh.")
+# 2. Ask questions with instant retrieval, re-ranking, and grounded generation
+res = bot.ask("What were the key drivers of Q4 revenue growth?")
 print(res.answer)
 
-# 2. On-Demand IRAC Mode -> Triggered simply by mentioning "IRAC" in the query
-irac_res = law_bot.ask("Explain Article 19(1)(a) and its reasonable restrictions in IRAC format")
-print(irac_res.answer)
+# 3. View sentence-level verifiable evidence citations
+print(res.format_citations())
 ```
 
 ---
 
-## 💬 Built-In ChatGPT-Style Studio UI (Jupyter & Web)
+## ⚡ Core Capabilities & Feature Matrix
 
-Launch an interactive ChatGPT-style Q&A Studio inside JupyterLab/Colab or as a standalone web server:
+| Capability | What It Does | Code Example |
+| :--- | :--- | :--- |
+| **15 Chunking Strategies** | Recursive, semantic, table-aware, code-aware, contextual, adaptive, etc. | `chunker.chunk(doc, strategy="table_aware")` |
+| **Multi-Strategy Combinations**| Combine multiple chunkers (multi-resolution, ensemble, chain, interleave) | `chunker.combine([c1, c2], mode="multi_resolution")` |
+| **Multilingual Engine** | One-parameter language switching with automatic script detection | `bot.ask("What is the refund policy?", language="Hindi")` |
+| **Hybrid Retrieval** | BM25 keyword matching fused with dense vector semantic search (RRF) | `bot.ask(q, hybrid=True, alpha=0.65)` |
+| **Flash Cross-Encoder Re-Ranker**| Re-score top candidate passages for maximum relevance before LLM generation | `bot.ask(q, rerank=True, reranker_top_k=3)` |
+| **Multi-Turn Chat Memory** | Stateful conversation tracking with sliding context memory | `bot.chat("What was our profit?"); bot.chat("How does that compare to 2024?")` |
+| **Sentence-Level Citations** | Fine-grained passage verification with exact page, chunk ID, and snippet | `print(res.format_citations())` |
+| **4-Layer OCR Fallback** | Native text $\to$ RapidOCR $\to$ PyTesseract $\to$ Gemini Vision AI | `parser.parse("scanned_receipt.pdf")` |
+| **Instant `<0.05s` Disk Reload** | Auto-persisted indices on disk; reload without re-parsing or re-embedding | `bot = ragspark.rag.load()` |
+| **Built-in UI Studio** | Inline Jupyter/Colab widget or full standalone Streamlit browser app | `ui.notebook_chat(bot)` or `ui.launch()` |
+
+---
+
+## 🛠 Deep Dive: Feature Highlights
+
+### 1. 15 Advanced Chunking Strategies & Combinations
+
+No single chunking strategy works for all data types. `ragspark` provides 15 specialized strategies and multi-strategy combiners:
+
+```python
+from ragspark import chunker, parser
+
+doc = parser.parse("technical_spec.pdf")
+
+# Specialized Strategies
+table_chunks = chunker.chunk(doc, strategy="table_aware")     # Preserves Markdown/HTML table integrity
+code_chunks  = chunker.chunk(doc, strategy="code_aware")      # Preserves AST functions & classes
+ctx_chunks   = chunker.chunk(doc, strategy="contextual")      # Prepends document-level contextual headers
+adapt_chunks = chunker.chunk(doc, strategy="adaptive")        # Dynamically splits based on document density
+
+# Multi-Strategy Combinations
+# 1. Multi-Resolution (Hierarchical parent-child indexing for precise search + broad LLM context)
+multi_res = chunker.combine([doc], mode="multi_resolution", small_chunk=150, large_chunk=600)
+
+# 2. Ensemble (Union of semantic + recursive chunkers with deduplication)
+ensemble_chunks = chunker.combine([table_chunks, code_chunks], mode="ensemble")
+
+# 3. Interleave (Round-robin interleaving across multiple sources)
+interleaved = chunker.combine([table_chunks, code_chunks], mode="interleave")
+```
+
+### 2. Multilingual RAG in 1 Parameter
+
+Deliver localized responses in any language without rebuilding prompt pipelines. `ragspark` detects Unicode scripts and injects native language directives:
+
+```python
+# Force output language explicitly
+res = bot.ask("Summarize the main compliance requirements", language="Spanish")
+print(res.answer)
+
+res = bot.ask("Summarize the main compliance requirements", language="Hindi")
+print(res.answer)
+
+# Or detect input question language automatically
+res = bot.ask("Comment fonctionne le processus d'onboarding?", language="auto")
+print(res.answer)
+```
+
+### 3. Hybrid BM25 + Dense Vector Search & Flash Re-Ranker
+
+Avoid semantic vector drift on exact acronyms, serial numbers, and entities with Reciprocal Rank Fusion (RRF) and Flash Re-ranking:
+
+```python
+# Hybrid Search + Cross-Encoder Flash Re-ranking in 1 call:
+res = bot.ask(
+    "What is error code E-8492 in Section 4.2?",
+    hybrid=True,          # BM25 + Dense vector search
+    alpha=0.65,           # Balance between semantic (0.65) and keyword (0.35)
+    rerank=True,          # Cross-encoder passage re-ranking
+    reranker_top_k=3,     # Send only the top 3 verified passages to the LLM
+)
+print(res.answer)
+```
+
+### 4. Stateful Multi-Turn Conversational Chat
+
+Build chatbots that remember previous turns and resolve conversational pronouns:
+
+```python
+# Turn 1
+ans1 = bot.chat("Who is the CEO of Acme Corp?")
+print(ans1.answer)
+
+# Turn 2 (Resolves 'he' based on conversation history)
+ans2 = bot.chat("When did he join the company?")
+print(ans2.answer)
+
+# Reset conversation history anytime
+bot.clear_history()
+```
+
+### 5. Sentence-Level Evidence Citations
+
+Guarantee explainability and prevent hallucination with verifiable sentence-level citations:
+
+```python
+res = bot.ask("What are the quarterly milestone deliverables?")
+
+# Formatted citations string
+print(res.format_citations())
+# Output:
+# [1] annual_report.pdf (Page 12, Chunk 84): "Milestone deliverable for Q3 entails API v2 release..."
+# [2] annual_report.pdf (Page 15, Chunk 97): "Q4 milestones target global deployment across 4 regions..."
+
+# Structured citation inspection
+for cite in res.citations:
+    print(f"Source: {cite['source']} (Page {cite['page']}) -> {cite['sentence']}")
+```
+
+### 6. Interactive Studio UI (Jupyter & Web)
+
+Test and demo your RAG pipelines with zero frontend boilerplate:
 
 ```python
 from ragspark import ui
 
-# Inside Jupyter Notebook / Google Colab:
+# 1. Inside Jupyter Notebook / Google Colab (Interactive widget):
 ui.notebook_chat(bot)
 
-# Or launch the full standalone browser app at http://127.0.0.1:8501:
-ui.launch()
+# 2. Or launch the standalone web browser app:
+ui.launch(port=8501)
 ```
 
-### CLI Commands
+---
+
+## 💻 Command Line Interface (CLI)
+
+`ragspark` comes equipped with a powerful CLI:
+
 ```bash
+# Launch interactive web studio
 ragspark ui --port 8501
-ragspark parse sample.pdf --mode auto --out parsed.json
-ragspark ask sample.pdf "Summarize the key findings"
-ragspark ask-law constitution.pdf "Explain Article 21"
+
+# Ingest and parse any document to clean JSON
+ragspark parse report.pdf --mode auto --out parsed.json
+
+# Instant terminal Q&A on any document
+ragspark ask system_manual.pdf "How do I configure the API token?"
+```
+
+---
+
+## 📑 Modular Architecture
+
+If you prefer building custom pipelines step-by-step, all modular components are decoupled:
+
+```python
+from ragspark import parser, chunker, vectordb, prompt_eng, llm, reranker
+
+# Step 1: Ingestion
+doc = parser.parse("document.pdf")
+
+# Step 2: Chunking
+chunks = chunker.chunk(doc, strategy="table_aware", chunk_size=500)
+
+# Step 3: Vector Storage
+db = vectordb.store(chunks, backend="chroma", collection_name="knowledge_base")
+
+# Step 4: Hybrid Retrieval
+hits = db.hybrid_search("financial forecast", top_k=10, alpha=0.7)
+
+# Step 5: Flash Re-ranking
+ranker = reranker.Reranker()
+top_hits = ranker.rerank("financial forecast", hits, top_k=3)
+
+# Step 6: Prompt Engineering
+prompt = prompt_eng.build(top_hits, query="financial forecast", technique="chain_of_thought")
+
+# Step 7: Generation
+answer = llm.generate(prompt, provider="gemini", model="gemini 3.8 flash")
+print(answer.text)
 ```
 
 ---
 
 ## 📄 License
 
-MIT License. See [`RAGSPARK_DOCUMENTATION.md`](RAGSPARK_DOCUMENTATION.md) for the complete command reference.
+MIT License. Built for production-grade Retrieval-Augmented Generation across all domains.

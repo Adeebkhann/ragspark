@@ -1,8 +1,8 @@
 """
-`raglib.parser` — Phase 1 Smart Unstructured & Legal Regex PDF Parser.
+`ragspark.parser` — Phase 1 Smart Unstructured & Legal Regex PDF Parser.
 
 Usage:
-    from raglib import parser
+    from ragspark import parser
 
     doc = parser.parse("contract_or_statute.pdf")       # Auto-detects law vs unstructured
     law_doc = parser.parse_law("judgment.pdf")          # Forces Legal Regex Intelligence
@@ -14,8 +14,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from raglib.parser.core import SmartParser, default_parser
-from raglib.parser.models import (
+from ragspark.parser.core import SmartParser, default_parser
+from ragspark.parser.models import (
     LegalCitation,
     LegalDefinition,
     LegalNode,

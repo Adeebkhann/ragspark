@@ -1,4 +1,4 @@
-"""Data models for raglib.parser — representing parsed unstructured & legal documents."""
+"""Data models for ragspark.parser — representing parsed unstructured & legal documents."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ class ParsedDocument:
     """
     Unified output of `parser.parse(...)`.
     Works seamlessly for both unstructured PDFs and structured Legal PDFs,
-    and feeds directly into future `raglib.chunker`, `raglib.embedder`, and `raglib.rag` modules.
+    and feeds directly into future `ragspark.chunker`, `ragspark.embedder`, and `ragspark.rag` modules.
     """
 
     source: str

@@ -1,5 +1,5 @@
 """
-`raglib.chunker` — Production Multi-Strategy & Combination Chunker (General + Law).
+`ragspark.chunker` — Production Multi-Strategy & Combination Chunker (General + Law).
 
 Supports 10 Individual Strategies + Multi-Strategy Combinations:
   - "auto"           (Picks "legal_clause" for law docs, "recursive" for general)
@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from raglib.parser import ParsedDocument, parse, parse_law, parse_text
+from ragspark.parser import ParsedDocument, parse, parse_law, parse_text
 
 
 @dataclass
@@ -62,6 +62,10 @@ AVAILABLE_STRATEGIES = (
     "sliding_window",
     "parent_child",
     "legal_clause",
+    "table_aware",
+    "code_aware",
+    "contextual",
+    "adaptive",
 )
 
 
@@ -263,6 +267,136 @@ def _split_semantic_cpu(text: str, chunk_size: int) -> list[str]:
     return chunks
 
 
+def _split_table_aware(text: str, chunk_size: int) -> list[str]:
+    """Preserves Markdown and delimited tables intact, splitting rows with repeated headers if oversized."""
+    lines = text.splitlines()
+    blocks: list[tuple[str, list[str]]] = []
+    current_type = "text"
+    current_lines: list[str] = []
+
+    def is_table_line(line: str) -> bool:
+        s = line.strip()
+        return (s.startswith("|") and s.endswith("|")) or bool(re.match(r"^\|?\s*[-:]+[-| :]*\|?$", s))
+
+    for line in lines:
+        if is_table_line(line):
+            if current_type != "table":
+                if current_lines:
+                    blocks.append(("text", current_lines))
+                current_lines = [line]
+                current_type = "table"
+            else:
+                current_lines.append(line)
+        else:
+            if current_type == "table":
+                if current_lines:
+                    blocks.append(("table", current_lines))
+                current_lines = [line]
+                current_type = "text"
+            else:
+                current_lines.append(line)
+
+    if current_lines:
+        blocks.append((current_type, current_lines))
+
+    chunks: list[str] = []
+    for b_type, b_lines in blocks:
+        block_txt = "\n".join(b_lines).strip()
+        if not block_txt:
+            continue
+        if b_type == "text":
+            chunks.extend(_split_recursive(block_txt, chunk_size, chunk_size // 8))
+        else:
+            if len(block_txt) <= int(chunk_size * 1.5) or len(b_lines) <= 3:
+                chunks.append(block_txt)
+            else:
+                header_lines = b_lines[:2]
+                header_prefix = "\n".join(header_lines)
+                curr_rows: list[str] = []
+                curr_len = len(header_prefix)
+                for row in b_lines[2:]:
+                    if curr_len + len(row) + 1 > chunk_size and curr_rows:
+                        chunks.append(f"{header_prefix}\n" + "\n".join(curr_rows))
+                        curr_rows = [row]
+                        curr_len = len(header_prefix) + len(row) + 1
+                    else:
+                        curr_rows.append(row)
+                        curr_len += len(row) + 1
+                if curr_rows:
+                    chunks.append(f"{header_prefix}\n" + "\n".join(curr_rows))
+    return chunks
+
+
+def _split_code_aware(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    """AST/syntax-conscious code splitter preserving function/class definitions and code blocks intact."""
+    pattern = re.compile(r"(```[\w]*\n[\s\S]*?```)")
+    tokens = pattern.split(text)
+    chunks: list[str] = []
+
+    for piece in tokens:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if piece.startswith("```") and piece.endswith("```"):
+            if len(piece) <= int(chunk_size * 1.5):
+                chunks.append(piece)
+            else:
+                lines = piece.splitlines()
+                lang_line = lines[0] if lines else "```"
+                code_lines = lines[1:-1] if len(lines) > 2 else lines
+                sub_blocks: list[list[str]] = []
+                cur_block: list[str] = []
+                for line in code_lines:
+                    if re.match(r"^(def\s+|class\s+|async\s+def\s+|function\s+|export\s+|pub\s+fn\s+)", line):
+                        if cur_block:
+                            sub_blocks.append(cur_block)
+                            cur_block = [line]
+                        else:
+                            cur_block.append(line)
+                    else:
+                        cur_block.append(line)
+                if cur_block:
+                    sub_blocks.append(cur_block)
+
+                for sb in sub_blocks:
+                    sb_text = f"{lang_line}\n" + "\n".join(sb) + "\n```"
+                    if len(sb_text) <= chunk_size:
+                        chunks.append(sb_text)
+                    else:
+                        chunks.extend(_split_recursive(sb_text, chunk_size, chunk_overlap))
+        else:
+            chunks.extend(_split_recursive(piece, chunk_size, chunk_overlap))
+    return chunks
+
+
+def _split_contextual(text: str, doc_name: str, chunk_size: int, chunk_overlap: int) -> list[tuple[str, str]]:
+    """Context-Enriched Splitter (Anthropic Contextual Retrieval pattern).
+    Prepends document title and section breadcrumbs to ensure zero ambiguity during retrieval."""
+    pairs = _split_markdown(text, chunk_size=max(200, chunk_size - 120), chunk_overlap=chunk_overlap)
+    if not pairs:
+        base_chunks = _split_recursive(text, chunk_size=max(200, chunk_size - 120), chunk_overlap=chunk_overlap)
+        pairs = [("General", c) for c in base_chunks]
+
+    results: list[tuple[str, str]] = []
+    clean_doc = Path(doc_name).stem.replace("_", " ").title() if doc_name else "Document"
+    for heading, chunk_txt in pairs:
+        context_header = f"[Context: {clean_doc} > {heading}]"
+        enriched_text = f"{context_header}\n{chunk_txt}"
+        results.append((heading, enriched_text))
+    return results
+
+
+def _split_adaptive(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
+    """Smart content router: routes code to code_aware, tables to table_aware, markdown to markdown, prose to recursive."""
+    if "```" in text:
+        return _split_code_aware(text, chunk_size, chunk_overlap)
+    if re.search(r"\|[-:]+\|", text):
+        return _split_table_aware(text, chunk_size)
+    if re.search(r"^#{1,6}\s+", text, flags=re.MULTILINE):
+        return [c for _, c in _split_markdown(text, chunk_size, chunk_overlap)]
+    return _split_recursive(text, chunk_size, chunk_overlap)
+
+
 class SmartChunker:
     """Multi-Strategy & Combination Chunker for General & Legal RAG."""
 
@@ -350,6 +484,24 @@ class SmartChunker:
                         section_path=header,
                         strategy="markdown",
                         metadata={"doc_type": doc.doc_type, "heading": header, "strategy": "markdown"},
+                    )
+                )
+            return chunks
+
+        if chosen == "contextual":
+            ctx_pairs = _split_contextual(doc.text, doc.source, chunk_size, chunk_overlap)
+            for header, piece in ctx_pairs:
+                idx += 1
+                chunks.append(
+                    Chunk(
+                        id=_make_chunk_id(doc.source, "contextual", idx, piece),
+                        text=piece,
+                        index=idx,
+                        source=doc.source,
+                        page_number=1,
+                        section_path=header,
+                        strategy="contextual",
+                        metadata={"doc_type": doc.doc_type, "heading": header, "strategy": "contextual"},
                     )
                 )
             return chunks
@@ -454,6 +606,34 @@ class SmartChunker:
                         )
                     )
             return refined
+
+        if mode.lower() in ("multi_resolution", "multiresolution", "hierarchical"):
+            macro_strat = clean_strats[0]
+            micro_strat = clean_strats[1] if len(clean_strats) > 1 else "sentence"
+            macro_chunks = self.chunk(doc, strategy=macro_strat, chunk_size=int(chunk_size * 2), chunk_overlap=chunk_overlap)
+            micro_chunks = self.chunk(doc, strategy=micro_strat, chunk_size=max(160, chunk_size // 2), chunk_overlap=max(20, chunk_overlap // 2))
+            for mic in micro_chunks:
+                for mac in macro_chunks:
+                    if mic.text[:60] in mac.text:
+                        mic.metadata["parent_macro_id"] = mac.id
+                        mic.metadata["parent_macro_preview"] = mac.text[:120]
+                        break
+            return macro_chunks + micro_chunks
+
+        if mode.lower() == "interleave":
+            groups = [self.chunk(doc, strategy=s, chunk_size=chunk_size, chunk_overlap=chunk_overlap) for s in clean_strats]
+            interleaved: list[Chunk] = []
+            max_len = max(len(g) for g in groups) if groups else 0
+            seen_texts_i: set[tuple[int, str]] = set()
+            for i in range(max_len):
+                for g in groups:
+                    if i < len(g):
+                        chk = g[i]
+                        key = (chk.page_number, chk.text.strip())
+                        if key not in seen_texts_i:
+                            seen_texts_i.add(key)
+                            interleaved.append(chk)
+            return interleaved
 
         # Default: Ensemble mode — combine chunks from all selected strategies (deduplicating exact identical text per page)
         combined: list[Chunk] = []
@@ -594,6 +774,12 @@ class SmartChunker:
             return _split_tokens(text, tok_size, tok_ov)
         if chosen == "semantic":
             return _split_semantic_cpu(text, chunk_size)
+        if chosen == "table_aware":
+            return _split_table_aware(text, chunk_size)
+        if chosen == "code_aware":
+            return _split_code_aware(text, chunk_size, chunk_overlap)
+        if chosen == "adaptive":
+            return _split_adaptive(text, chunk_size, chunk_overlap)
         return _split_recursive(text, chunk_size, chunk_overlap)
 
     def _coerce_document(self, doc_or_source: ParsedDocument | str | Path, force_law: bool = False) -> ParsedDocument:
@@ -689,3 +875,4 @@ __all__ = [
     "list_strategies",
     "AVAILABLE_STRATEGIES",
 ]
+

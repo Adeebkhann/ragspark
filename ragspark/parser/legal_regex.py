@@ -1,5 +1,5 @@
 """
-Legal Regex Intelligence Engine for raglib.parser.
+Legal Regex Intelligence Engine for ragspark.parser.
 Extracts legal hierarchy (Parts, Chapters, Articles, Sections, Subsections, Clauses, Provisos),
 Case & Statute Citations, Legal Definitions, Obligations/Prohibitions, and Court/Contract Metadata.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from raglib.parser.models import (
+from ragspark.parser.models import (
     LegalCitation,
     LegalDefinition,
     LegalNode,

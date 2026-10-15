@@ -1,5 +1,5 @@
 """
-`raglib.prompt_eng` — Phase 5: Customizable Prompt Engineering, Query Rewriting & Legal Story Solver.
+`ragspark.prompt_eng` — Phase 5: Customizable Prompt Engineering, Query Rewriting & Legal Story Solver.
 
 Supports:
   - General Query Rewriting (`prompt_eng.rewrite_query(query)`)
@@ -17,8 +17,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from raglib.chunker import Chunk
-from raglib.vectordb import SearchResult
+from ragspark.chunker import Chunk
+from ragspark.vectordb import SearchResult
 
 DEFAULT_GENERAL_SYSTEM_PROMPT = (
     "You are an accurate, helpful AI assistant. Answer the user's question in clear, natural, well-structured "
@@ -402,6 +402,58 @@ def rewrite_law_query(query: str, strategy: str = "auto") -> QueryRewriteResult:
     )
 
 
+def detect_language(text: str) -> str:
+    """
+    Detect the language/script of text.
+    Returns standard language name (e.g. 'Hindi', 'Spanish', 'French', 'Japanese', 'English').
+    """
+    if not text or not text.strip():
+        return "English"
+
+    # Unicode Script Detection
+    if re.search(r"[\u0900-\u097F]", text):
+        return "Hindi"
+    if re.search(r"[\u0980-\u09FF]", text):
+        return "Bengali"
+    if re.search(r"[\u0B80-\u0BFF]", text):
+        return "Tamil"
+    if re.search(r"[\u0C00-\u0C7F]", text):
+        return "Telugu"
+    if re.search(r"[\u0C80-\u0CFF]", text):
+        return "Kannada"
+    if re.search(r"[\u0D00-\u0D7F]", text):
+        return "Malayalam"
+    if re.search(r"[\u0A00-\u0A7F]", text):
+        return "Punjabi"
+    if re.search(r"[\u0A80-\u0AFF]", text):
+        return "Gujarati"
+    if re.search(r"[\u0600-\u06FF]", text):
+        return "Arabic"
+    if re.search(r"[\u0400-\u04FF]", text):
+        return "Russian"
+    if re.search(r"[\u3040-\u30FF\u31F0-\u31FF]", text):
+        return "Japanese"
+    if re.search(r"[\u4E00-\u9FFF]", text):
+        return "Chinese"
+    if re.search(r"[\uAC00-\uD7AF\u1100-\u11FF]", text):
+        return "Korean"
+
+    # Latin Stopword Scoring
+    words = set(re.findall(r"\w+", text.lower()))
+    scores: dict[str, int] = {
+        "German": len({"was", "wie", "warum", "welche", "welcher", "welches", "für", "mit", "über", "ist", "sind", "nicht", "eine", "einer", "eines", "einem", "einen", "der", "die", "das", "den", "dem", "des", "und", "oder"} & words),
+        "French": len({"quel", "quelle", "quels", "quelles", "comment", "pour", "avec", "dans", "sur", "est", "sont", "les", "des", "pourquoi", "une", "cette", "cet", "du", "qui"} & words),
+        "Spanish": len({"qué", "como", "cuál", "cuáles", "para", "sobre", "del", "las", "los", "este", "esta", "estos", "estas", "por", "donde", "quién"} & words),
+        "Portuguese": len({"qual", "quais", "como", "para", "sobre", "com", "este", "esta", "estes", "estas", "são", "onde", "quem", "você", "uma"} & words),
+        "Italian": len({"cosa", "come", "quale", "quali", "per", "con", "sono", "della", "delle", "degli", "perché", "dove", "chi"} & words),
+    }
+    best_lang, best_score = max(scores.items(), key=lambda kv: kv[1])
+    if best_score > 0:
+        return best_lang
+
+    return "English"
+
+
 @dataclass
 class BuiltPrompt:
     """Structured prompt package containing `system_prompt`, `user_prompt`, and `full_prompt`."""
@@ -415,6 +467,7 @@ class BuiltPrompt:
     is_story: bool = False
     wants_irac: bool = False
     actors: list[str] = field(default_factory=list)
+    language: str | None = None
 
     @property
     def full_prompt(self) -> str:
@@ -482,7 +535,7 @@ def _extract_items_from_obj(obj: Any) -> list[Any] | None:
         return list(getattr(obj, "_chunks"))
     # ParsedDocument (`doc`)
     if hasattr(obj, "flat_sections") and getattr(obj, "flat_sections"):
-        from raglib import chunker as chunker_mod
+        from ragspark import chunker as chunker_mod
 
         try:
             return chunker_mod.chunk_law(obj)
@@ -514,7 +567,7 @@ def _rank_context_items_by_query(
     if not q_clean or q_clean.startswith("Explain the "):
         return items[:max_chunks] if max_chunks else items
 
-    from raglib.vectordb import _bm25_keyword_score
+    from ragspark.vectordb import _bm25_keyword_score
 
     scored: list[tuple[float, int, Any]] = []
     for idx, it in enumerate(items):
@@ -656,7 +709,7 @@ def _get_session_fallback_items() -> list[Any]:
     Chunker (`chunks`), or Parser (`doc`) so the model never lacks document context!
     """
     try:
-        from raglib.vectordb import _LAST_ACTIVE_STORE
+        from ragspark.vectordb import _LAST_ACTIVE_STORE
 
         if _LAST_ACTIVE_STORE is not None and getattr(_LAST_ACTIVE_STORE, "_chunks", None):
             return list(_LAST_ACTIVE_STORE._chunks)
@@ -664,7 +717,7 @@ def _get_session_fallback_items() -> list[Any]:
         pass
 
     try:
-        from raglib.chunker import _LAST_ACTIVE_CHUNKS
+        from ragspark.chunker import _LAST_ACTIVE_CHUNKS
 
         if _LAST_ACTIVE_CHUNKS:
             return list(_LAST_ACTIVE_CHUNKS)
@@ -672,7 +725,7 @@ def _get_session_fallback_items() -> list[Any]:
         pass
 
     try:
-        from raglib.parser.core import _LAST_PARSED_DOC
+        from ragspark.parser.core import _LAST_PARSED_DOC
 
         if _LAST_PARSED_DOC is not None:
             extracted = _extract_items_from_obj(_LAST_PARSED_DOC)
@@ -685,7 +738,7 @@ def _get_session_fallback_items() -> list[Any]:
     # automatically reload the most recently persisted VectorStore from `.ragspark_store` on disk!
     try:
         from pathlib import Path
-        from raglib import vectordb as vdb_mod
+        from ragspark import vectordb as vdb_mod
 
         if Path(".ragspark_store/_last_active.txt").exists():
             disk_store = vdb_mod.load()
@@ -703,6 +756,7 @@ def build(
     technique: str = "standard",
     system_prompt: str | None = None,
     user_template: str | None = None,
+    language: str | None = None,
     *,
     query: str | None = None,
     context: list[SearchResult] | list[Chunk] | list[str] | Any = None,
@@ -712,6 +766,7 @@ def build(
     """
     Build a complete System + User prompt for any general or legal RAG task.
     - Generates natural, flowing sentences by default.
+    - Supports Multilingual generation (`language="Hindi"`, `"Spanish"`, `"German"`, `"auto"`, etc.).
     - Automatically switches to IRAC formatting ONLY if the user writes 'IRAC' in their query!
     - Automatically rewrites queries & detects story/scenario questions.
     """
@@ -739,7 +794,23 @@ def build(
             "the governing provisions apply to the people and events described."
         )
 
+    # Multilingual target resolution
+    resolved_lang: str | None = None
+    if language:
+        if str(language).lower().strip() == "auto":
+            resolved_lang = detect_language(resolved_query)
+        else:
+            resolved_lang = str(language).strip()
+
     sys_p = (system_prompt or (DEFAULT_LAW_SYSTEM_PROMPT if is_law else DEFAULT_GENERAL_SYSTEM_PROMPT)).strip()
+    if resolved_lang and resolved_lang.lower() != "english":
+        sys_p += f" You MUST formulate and write your final response strictly and fluently in {resolved_lang}."
+        tech_instruction += (
+            f"\n- MULTILINGUAL REQUIREMENT: Output your response strictly and fluently in **{resolved_lang}**. "
+            f"Preserve technical terms, proper nouns, and citation numbers intact.\n"
+            f"- Output Language: {resolved_lang}"
+        )
+
     ctx_str = _format_context(resolved_ctx)
 
     if user_template:
@@ -749,12 +820,13 @@ def build(
             technique=tech_instruction,
         )
     else:
+        lang_tag = f" (IN {resolved_lang.upper()})" if (resolved_lang and resolved_lang.lower() != "english") else ""
         user_p = (
             f"### RETRIEVED CONTEXT\n{ctx_str}\n\n"
             f"### ANSWER STYLE & INSTRUCTIONS ({tech_key.upper()})\n{tech_instruction}\n\n"
             f"### USER QUESTION\n{resolved_query}\n"
             f"### REWRITTEN SEARCH INTENT\n{rw.rewritten}\n\n"
-            f"### RESPONSE\n"
+            f"### RESPONSE{lang_tag}\n"
         )
 
     bp = BuiltPrompt(
@@ -767,6 +839,7 @@ def build(
         is_story=rw.is_story,
         wants_irac=rw.wants_irac,
         actors=rw.actors,
+        language=resolved_lang,
     )
     # Keep a reference to raw context items so if the user passes `query="..."` later in `llm.generate(prompt, query="...")`,
     # `llm.generate` can re-rank the full chunk pool for that specific question!
@@ -780,6 +853,7 @@ def build_law(
     technique: str = "natural_law",
     system_prompt: str | None = None,
     user_template: str | None = None,
+    language: str | None = None,
     *,
     query: str | None = None,
     context: list[SearchResult] | list[Chunk] | list[str] | None = None,
@@ -788,6 +862,7 @@ def build_law(
     """
     Specialized Law Prompt Builder:
     - Generates natural, fluent legal sentences by default (`technique="natural_law"`).
+    - Supports Multilingual legal reasoning (`language="Hindi"`, `"Spanish"`, etc.).
     - Automatically switches to IRAC if the user writes `"IRAC"` in their query!
     - Includes Legal Story / Scenario analysis & Legal Query Rewriting.
     """
@@ -797,6 +872,7 @@ def build_law(
         technique=technique,
         system_prompt=system_prompt or DEFAULT_LAW_SYSTEM_PROMPT,
         user_template=user_template,
+        language=language,
         query=query,
         context=context,
         max_chunks=max_chunks,
@@ -809,6 +885,7 @@ __all__ = [
     "QueryRewriteResult",
     "build",
     "build_law",
+    "detect_language",
     "rewrite_query",
     "rewrite_law_query",
     "detect_query_intent",

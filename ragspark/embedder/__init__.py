@@ -1,5 +1,5 @@
 """
-`raglib.embedder` — Production Multi-Strategy & Multi-Provider Embedding Engine.
+`ragspark.embedder` — Production Multi-Strategy & Multi-Provider Embedding Engine.
 
 Supports:
   1. Embedding Providers (`provider=`):
@@ -27,7 +27,7 @@ import re
 import urllib.request
 from typing import Any, Callable
 
-from raglib.chunker import Chunk
+from ragspark.chunker import Chunk
 
 AVAILABLE_PROVIDERS = (
     "fast_local",

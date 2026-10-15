@@ -1,5 +1,5 @@
 """
-High-Speed Multi-Engine PDF & Document Extractor for raglib.parser.
+High-Speed Multi-Engine PDF & Document Extractor for ragspark.parser.
 Optimized for Laptop Performance:
   1. PyMuPDF (pymupdf) C-level block extraction (`page.get_text("blocks")`) — 100+ pages in <0.3s
   2. Native PyMuPDF C-level table finder (`page.find_tables()`) when `extract_tables="fast"`
@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from raglib.parser.models import TableBlock
+from ragspark.parser.models import TableBlock
 
 
 def _rows_to_markdown(headers: list[str], rows: list[list[str]]) -> str:

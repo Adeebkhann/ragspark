@@ -31,3 +31,7 @@ sample_legal_judgment.pdf
 _bmad/
 _bmad-output/
 
+# Finetuning specs / proposals
+*FINETUN*
+*.html
+

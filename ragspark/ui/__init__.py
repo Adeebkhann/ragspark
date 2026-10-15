@@ -1,12 +1,12 @@
 """
-`raglib.ui` — Clean, Minimal, Fully Customizable Chatbot UI for Student Demos & Production.
+`ragspark.ui` — Clean, Minimal, Fully Customizable Chatbot UI for Student Demos & Production.
 
 Shows ONLY the clean Chat Header, Question & Answer messages, and the Message Input Bar at the bottom!
 100% customizable via Python arguments (`title`, `subtitle`, `bot_name`, `welcome_message`, `theme`,
 `accent_color`, `bg_color`, `show_sources`, `custom_css`) OR live in the browser via the optional Customize drawer.
 
 Usage:
-    from raglib import ui
+    from ragspark import ui
 
     # Pass your RAG pipeline directly into the Chatbot UI:
     ui.launch(pipe, title="Constitution of India Chatbot", theme="dark")
@@ -23,16 +23,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from raglib import rag
-from raglib.rag import RAGPipeline
+from ragspark import rag
+from ragspark.rag import RAGPipeline
 
-DEFAULT_DEMO_LAW_TEXT = """IN THE SUPREME COURT OF INDIA
-PART III - FUNDAMENTAL RIGHTS
-Article 14. Equality before law.- The State shall not deny to any person equality before the law or the equal protection of the laws within the territory of India.
-Article 19. Protection of certain rights regarding freedom of speech, etc.- (1) All citizens shall have the right (a) to freedom of speech and expression; (b) to assemble peaceably and without arms; (c) to form associations or unions.
-Article 21. Protection of life and personal liberty.- No person shall be deprived of his life or personal liberty except according to procedure established by law.
-Article 21A. Right to education.- The State shall provide free and compulsory education to all children of the age of six to fourteen years in such manner as the State may, by law, determine.
-Article 32. Remedies for enforcement of rights conferred by this Part.- (1) The right to move the Supreme Court by appropriate proceedings for the enforcement of the rights conferred by this Part is guaranteed."""
+DEFAULT_DEMO_TEXT = """RAGSPARK ENTERPRISE KNOWLEDGE BASE
+Chapter 1: Platform Architecture & Operations
+Section 1.1: System Overview - RagSpark is an all-in-one unified Retrieval-Augmented Generation (RAG) framework designed for multi-format document ingestion, hybrid vector/keyword search, and accurate grounded generation across any domain.
+Section 1.2: Privacy & Security - All vector embeddings and parsed document chunks are stored locally within the persistent vector store. Zero proprietary data leaves your environment without your explicit configuration.
+Section 1.3: Scalability - RagSpark supports multi-threading, dynamic batching, and sub-50ms hybrid retrieval across enterprise-scale document repositories.
+Section 2: Support & SLA - Standard enterprise response times are guaranteed within 1 hour for critical incidents, with automated health checks running continuously."""
 
 THEMES: dict[str, dict[str, str]] = {
     "dark": {
@@ -616,9 +615,9 @@ def launch(
     if isinstance(pipeline_or_source, RAGPipeline):
         active_pipe = pipeline_or_source
     elif pipeline_or_source is not None:
-        active_pipe = rag.create_law(pipeline_or_source)
+        active_pipe = rag.create(pipeline_or_source)
     else:
-        active_pipe = rag.create_law(DEFAULT_DEMO_LAW_TEXT)
+        active_pipe = rag.create(DEFAULT_DEMO_TEXT)
 
     ui_config = {
         "title": title,

@@ -1,4 +1,4 @@
-"""Comprehensive test suite for `raglib` v0.3.0 (parser, 10 chunkers + combinations, embed strategies, 7 retrievers, UI)."""
+"""Comprehensive test suite for `ragspark` v0.3.0 (parser, 15 chunkers + combinations, embed strategies, 7 retrievers, UI)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from pathlib import Path
 import pymupdf as fitz
 import pytest
 
-import raglib
-from raglib import chunker, embedder, llm, parser, prompt_eng, rag, ui, vectordb
-from raglib.cli import main as cli_main
+import ragspark
+from ragspark import chunker, embedder, llm, parser, prompt_eng, rag, ui, vectordb
+from ragspark.cli import main as cli_main
 
 
 SAMPLE_LAW_TEXT = """
@@ -79,7 +79,7 @@ def _create_multi_page_law_pdf(pdf_path: Path, num_pages: int = 30) -> Path:
 
 
 def test_import_style_and_all_modules() -> None:
-    """Verify `from raglib import parser, chunker, embedder, vectordb, prompt_eng, llm, rag, ui` works."""
+    """Verify `from ragspark import parser, chunker, embedder, vectordb, prompt_eng, llm, rag, ui` works."""
     assert hasattr(parser, "parse")
     assert hasattr(chunker, "chunk")
     assert hasattr(chunker, "chunk_combination")
@@ -90,7 +90,7 @@ def test_import_style_and_all_modules() -> None:
     assert hasattr(rag, "create")
     assert hasattr(rag, "create_law")
     assert hasattr(ui, "launch")
-    assert raglib.__version__ == "0.3.0"
+    assert ragspark.__version__ == "0.3.0"
 
 
 def test_fast_30_page_pdf_speed_and_cleaning(tmp_path: Path) -> None:
@@ -315,7 +315,7 @@ def test_step7_notebook_screenshot_regression() -> None:
     Verify it NEVER outputs 'I could not find relevant passages in the document to answer your question.'
     even when `prompt` was built without hits or without a query in Step 6!
     """
-    from raglib import llm, prompt_eng
+    from ragspark import llm, prompt_eng
 
     # Case 1: User built `prompt` in Step 6 with empty/missing hits or without passing `query`
     empty_prompt = prompt_eng.build(technique="standard")

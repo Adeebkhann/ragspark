@@ -1,5 +1,5 @@
 """
-`raglib.llm` — Multi-Runtime LLM Execution Engine with Smart Model Name Resolution.
+`ragspark.llm` — Multi-Runtime LLM Execution Engine with Smart Model Name Resolution.
 
 Supports ANY model name (including human-friendly names like "gemini 3.8 flash", "claude sonnet 5.5", "gpt-4o", "llama3.2")
 and automatically detects or routes to:
@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from raglib.prompt_eng import BuiltPrompt
+from ragspark.prompt_eng import BuiltPrompt
 
 AVAILABLE_LLM_PROVIDERS = (
     "auto",
@@ -206,7 +206,7 @@ def generate(
 
     # If user passed raw hits/chunks or (query, context) directly into llm.generate(...) without calling prompt_eng.build
     if not isinstance(prompt, BuiltPrompt):
-        from raglib import prompt_eng as prompt_mod
+        from ragspark import prompt_eng as prompt_mod
 
         if isinstance(prompt, (list, tuple)) or context is not None:
             prompt = prompt_mod.build(
@@ -227,7 +227,7 @@ def generate(
         # If the user passed `query=...` in `llm.generate(prompt, query="...")` (Step 7) OR `ctx_text` is empty,
         # re-rank the full chunk pool (or session fallback chunks) specifically for `query_text`!
         if (query and query != prompt.query) or not ctx_text.strip():
-            from raglib.prompt_eng import (
+            from ragspark.prompt_eng import (
                 _BUILTIN_CONSTITUTIONAL_CHUNKS,
                 _format_context,
                 _get_session_fallback_items,
@@ -277,7 +277,7 @@ def generate(
         ctx_text = str(prompt) if prompt is not None else ""
         query_text = query or str(prompt or "")
         if not ctx_text.strip() or (query and ctx_text.strip() == query.strip()):
-            from raglib.prompt_eng import (
+            from ragspark.prompt_eng import (
                 _format_context,
                 _get_session_fallback_items,
                 _rank_context_items_by_query,
@@ -662,7 +662,7 @@ def _synthesize_extractive(
     """
     if not context_text.strip():
         try:
-            from raglib.prompt_eng import (
+            from ragspark.prompt_eng import (
                 _format_context,
                 _get_session_fallback_items,
                 _rank_context_items_by_query,
@@ -680,7 +680,7 @@ def _synthesize_extractive(
     if not context_text.strip():
         return "I could not find relevant passages in the document to answer your question."
 
-    from raglib.prompt_eng import detect_query_intent
+    from ragspark.prompt_eng import detect_query_intent
 
     intent = detect_query_intent(query)
     wants_irac = intent["wants_irac"] or (technique.lower().strip() == "strict_irac")
