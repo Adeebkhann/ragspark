@@ -2,11 +2,18 @@
 `ragspark.vectordb` — Production Multi-Backend VectorDB & Multi-Strategy Retrieval Engine.
 
 Supported VectorDB Providers (`provider=`):
-  - "chroma"   (Default: ChromaDB native or persistent local Chroma-compatible engine)
+  - "memory"   (Default: in-memory Hybrid Vector + BM25 store; zero files written)
+  - "sqlite"   (Same engine, intended for use with `persist_dir=`)
+  - "chroma"   (ChromaDB native when installed, else the local engine)
   - "pinecone" (Pinecone cloud vector DB)
   - "mongodb"  (MongoDB Atlas Vector Search)
   - "qdrant"   (Qdrant local/cloud vector DB)
-  - "memory"   (Fast in-memory Hybrid Vector + BM25 store)
+
+Storage rules:
+  - Nothing touches the disk unless `persist_dir=` is passed. Then rows go to
+    `<persist_dir>/ragspark.db` (SQLite, WAL mode), one transaction per `add()`/`save()`.
+  - In-memory stores past 10,000 chunks spill embeddings to a SQLite file under
+    `tempfile.gettempdir()`, deleted when the store is closed or garbage-collected.
 
 Supported Retrieval Techniques (`strategy=`):
   - "hybrid"      (Default: Weighted Dense Semantic + BM25 Keyword + Legal Section Boost)
@@ -22,14 +29,21 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import sqlite3
+import tempfile
+import uuid
+import weakref
+from array import array
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ragspark.chunker import Chunk
 
-AVAILABLE_VECTORDBS = ("chroma", "pinecone", "mongodb", "qdrant", "memory")
+AVAILABLE_VECTORDBS = ("memory", "sqlite", "chroma", "pinecone", "mongodb", "qdrant")
 
 AVAILABLE_RETRIEVAL_STRATEGIES = (
     "hybrid",
@@ -152,35 +166,141 @@ def _cross_feature_rerank_score(query_text: str, chunk: Chunk, base_score: float
 
 _LAST_ACTIVE_STORE: VectorStore | None = None
 
+SPILL_THRESHOLD = 10_000
+"""In-memory stores without `persist_dir` move embeddings to a temp-dir SQLite file past this many chunks."""
+
+_DB_FILENAME = "ragspark.db"
+_LEGACY_STORE_DIR = Path(".ragspark_store")
+
+
+def _pack(vec: list[float]) -> bytes:
+    return array("f", vec).tobytes() if vec else b""
+
+
+def _unpack(blob: bytes | None) -> list[float]:
+    if not blob:
+        return []
+    arr = array("f")
+    arr.frombytes(blob)
+    return arr.tolist()
+
+
+class _SQLiteStore:
+    """
+    Minimal SQLite (WAL) persistence for one collection.
+
+    A connection is opened per operation and closed right after, so no file handle outlives
+    a call (Windows can then delete the directory) and every write is one atomic transaction.
+    """
+
+    def __init__(self, path: Path, collection: str) -> None:
+        self.path = path
+        self.collection = collection
+        self._schema_ready = False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        if not self._schema_ready:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS chunks ("
+                    " collection TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL,"
+                    " data TEXT NOT NULL, embedding BLOB, PRIMARY KEY (collection, id))"
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS chunks_seq ON chunks (collection, seq)")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS meta (collection TEXT NOT NULL, key TEXT NOT NULL,"
+                    " value TEXT, PRIMARY KEY (collection, key))"
+                )
+            self._schema_ready = True
+        return conn
+
+    def upsert(self, rows: list[tuple[int, Chunk, list[float]]], meta: dict[str, str] | None = None) -> None:
+        """Write all rows (and metadata) in ONE transaction: a single disk commit per call."""
+        with closing(self._connect()) as conn, conn:
+            conn.executemany(
+                "INSERT INTO chunks (collection, id, seq, data, embedding) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(collection, id) DO UPDATE SET data=excluded.data, embedding=excluded.embedding",
+                [
+                    (self.collection, c.id, seq, json.dumps(c.to_dict(), ensure_ascii=False), _pack(e))
+                    for seq, c, e in rows
+                ],
+            )
+            if meta:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO meta (collection, key, value) VALUES (?, ?, ?)",
+                    [(self.collection, k, v) for k, v in meta.items()],
+                )
+
+    def load(self) -> tuple[list[Chunk], list[list[float]], dict[str, str]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT data, embedding FROM chunks WHERE collection=? ORDER BY seq", (self.collection,)
+            ).fetchall()
+            meta = dict(conn.execute("SELECT key, value FROM meta WHERE collection=?", (self.collection,)).fetchall())
+        chunks = [Chunk(**json.loads(d)) for d, _ in rows]
+        embs = [_unpack(e) for _, e in rows]
+        return chunks, embs, meta
+
+    def iter_embeddings(self, batch: int = 2048) -> Iterator[list[float]]:
+        """Stream embeddings in insertion order without loading them all into RAM."""
+        with closing(self._connect()) as conn:
+            cur = conn.execute("SELECT embedding FROM chunks WHERE collection=? ORDER BY seq", (self.collection,))
+            while True:
+                rows = cur.fetchmany(batch)
+                if not rows:
+                    break
+                for (blob,) in rows:
+                    yield _unpack(blob)
+
+    def destroy(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(f"{self.path}{suffix}").unlink()
+            except OSError:
+                pass
+
 
 class VectorStore:
-    """Unified VectorDB interface supporting ChromaDB (default), Pinecone, MongoDB, Qdrant, and Memory."""
+    """
+    Unified VectorDB interface: in-memory by default, SQLite WAL when `persist_dir` is given,
+    plus native ChromaDB / Pinecone / MongoDB / Qdrant backends when their clients are installed.
+
+    Nothing is written to disk unless `persist_dir` (alias `persist_directory`) is passed. A
+    memory store that grows past 10,000 chunks moves its embeddings to a SQLite file under
+    `tempfile.gettempdir()`, which is deleted when the store is closed or garbage-collected.
+    """
 
     def __init__(
         self,
-        provider: str = "chroma",
-        collection_name: str = "raglib_collection",
+        provider: str = "memory",
+        collection_name: str = "ragspark_collection",
         persist_directory: str | Path | None = None,
         api_key: str | None = None,
         connection_uri: str | None = None,
         backend: str | None = None,
-        embed_provider: str = "fast_local",
+        embed_provider: str = "auto",
         embed_strategy: str = "dense",
         embed_model: str | None = None,
         embed_api_key: str | None = None,
         embed_dimension: int = 384,
+        persist_dir: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         global _LAST_ACTIVE_STORE
-        raw_prov = backend or provider
+        raw_prov = backend or provider or "memory"
         self.provider = raw_prov.lower().strip()
         if self.provider in ("chromadb", "chroma_db"):
             self.provider = "chroma"
         if self.provider not in AVAILABLE_VECTORDBS:
             raise ValueError(f"Unsupported vectordb '{raw_prov}'. Choose from: {AVAILABLE_VECTORDBS}")
 
+        target = persist_dir if persist_dir is not None else persist_directory
         self.collection_name = collection_name
-        self.persist_directory = Path(persist_directory) if persist_directory else None
+        self.persist_directory = Path(target) if target else None
         self.api_key = api_key
         self.connection_uri = connection_uri
         self.embed_provider = embed_provider
@@ -194,9 +314,22 @@ class VectorStore:
         self._embeddings: list[list[float]] = []
         self._native_backend: Any = None
         self._backend_name = self.provider
+        self._sqlite: _SQLiteStore | None = None
+        self._spill: _SQLiteStore | None = None
+        self._pending: list[tuple[int, Chunk, list[float]]] = []
+        self._seq = 0
 
         self._init_backend()
         _LAST_ACTIVE_STORE = self
+
+    @property
+    def persist_dir(self) -> Path | None:
+        return self.persist_directory
+
+    @property
+    def is_spilled(self) -> bool:
+        """True once embeddings have moved to the temp-dir SQLite spill file."""
+        return self._spill is not None
 
     def _init_backend(self) -> None:
         if self.provider == "chroma":
@@ -209,52 +342,23 @@ class VectorStore:
                     client = chromadb.EphemeralClient()
                 self._native_backend = client.get_or_create_collection(name=self.collection_name)
                 self._backend_name = "chromadb_native"
-                try:
-                    existing = self._native_backend.get(include=["documents", "embeddings", "metadatas"])
-                    raw_ids = existing.get("ids")
-                    raw_docs = existing.get("documents")
-                    raw_embs = existing.get("embeddings")
-                    raw_metas = existing.get("metadatas")
-                    ids = list(raw_ids) if raw_ids is not None else []
-                    docs = list(raw_docs) if raw_docs is not None else []
-                    embs = list(raw_embs) if raw_embs is not None else []
-                    metas = list(raw_metas) if raw_metas is not None else []
-                    for idx_c, (cid, doc_txt, emb_vec) in enumerate(zip(ids, docs, embs)):
-                        meta = metas[idx_c] if idx_c < len(metas) and metas[idx_c] is not None else {}
-                        self._chunks.append(
-                            Chunk(
-                                id=str(cid),
-                                text=str(doc_txt or ""),
-                                index=idx_c + 1,
-                                source=str(meta.get("source", "chroma")),
-                                page_number=int(meta.get("page_number", 1)),
-                                section_path=str(meta.get("section_path", "")),
-                                strategy=str(meta.get("strategy", "recursive")),
-                                metadata=dict(meta),
-                            )
-                        )
-                        self._embeddings.append([float(x) for x in emb_vec])
-                except Exception:
-                    pass
+                self._load_from_chroma()
             except Exception:
                 self._backend_name = "chroma_local_engine"
-            if not self._chunks:
-                self._load_local_persistence()
 
         elif self.provider == "pinecone":
+            self._backend_name = "pinecone_local_adapter"
             if self.api_key:
                 try:
                     from pinecone import Pinecone  # type: ignore[import-not-found]
 
-                    pc = Pinecone(api_key=self.api_key)
-                    self._native_backend = pc.Index(self.collection_name)
+                    self._native_backend = Pinecone(api_key=self.api_key).Index(self.collection_name)
                     self._backend_name = "pinecone_native"
                 except Exception:
-                    self._backend_name = "pinecone_local_adapter"
-            else:
-                self._backend_name = "pinecone_local_adapter"
+                    pass
 
         elif self.provider == "mongodb":
+            self._backend_name = "mongodb_local_adapter"
             if self.connection_uri:
                 try:
                     from pymongo import MongoClient  # type: ignore[import-not-found]
@@ -264,22 +368,98 @@ class VectorStore:
                     self._native_backend = client[db_name][self.collection_name]
                     self._backend_name = "mongodb_native"
                 except Exception:
-                    self._backend_name = "mongodb_local_adapter"
-            else:
-                self._backend_name = "mongodb_local_adapter"
+                    pass
 
         elif self.provider == "qdrant":
             try:
                 from qdrant_client import QdrantClient  # type: ignore[import-not-found]
 
-                client = QdrantClient(url=self.connection_uri, api_key=self.api_key) if self.connection_uri else QdrantClient(":memory:")
-                self._native_backend = client
+                self._native_backend = (
+                    QdrantClient(url=self.connection_uri, api_key=self.api_key)
+                    if self.connection_uri
+                    else QdrantClient(":memory:")
+                )
                 self._backend_name = "qdrant_native"
             except Exception:
                 self._backend_name = "qdrant_local_adapter"
 
-    def add(self, chunks: list[Chunk], embeddings: list[list[float]] | None = None) -> int:
-        """Insert or update chunks and their embeddings in the chosen VectorDB (auto-embeds if `embeddings` is omitted)."""
+        # Local persistence: only when the caller asked for it, and only for backends
+        # that do not persist on their own.
+        if self.persist_directory and self._backend_name != "chromadb_native":
+            self._sqlite = _SQLiteStore(self.persist_directory / _DB_FILENAME, self.collection_name)
+            chunks, embs, meta = self._sqlite.load()
+            if chunks:
+                self._chunks, self._embeddings = chunks, embs
+                self._seq = len(chunks)
+                self._adopt_meta(meta)
+            else:
+                self._import_legacy_json(self.persist_directory)
+
+    def _adopt_meta(self, meta: dict[str, str]) -> None:
+        """Reuse the embedder that built a persisted collection so query vectors match."""
+        if self.embed_provider == "auto" and meta.get("embed_provider"):
+            self.embed_provider = meta["embed_provider"]
+        if not self.embed_model and meta.get("embed_model"):
+            self.embed_model = meta["embed_model"]
+        if meta.get("embed_strategy"):
+            self.embed_strategy = meta["embed_strategy"]
+
+    def _load_from_chroma(self) -> None:
+        try:
+            existing = self._native_backend.get(include=["documents", "embeddings", "metadatas"])
+        except Exception:
+            return
+        ids = list(existing.get("ids") or [])
+        docs = list(existing.get("documents") or [])
+        embs = existing.get("embeddings")
+        embs = list(embs) if embs is not None else []
+        metas = list(existing.get("metadatas") or [])
+        for i, (cid, doc_txt, emb_vec) in enumerate(zip(ids, docs, embs)):
+            meta = metas[i] if i < len(metas) and metas[i] is not None else {}
+            self._chunks.append(
+                Chunk(
+                    id=str(cid),
+                    text=str(doc_txt or ""),
+                    index=i + 1,
+                    source=str(meta.get("source", "chroma")),
+                    page_number=int(meta.get("page_number", 1)),
+                    section_path=str(meta.get("section_path", "")),
+                    strategy=str(meta.get("strategy", "recursive")),
+                    metadata=dict(meta),
+                )
+            )
+            self._embeddings.append([float(x) for x in emb_vec])
+        self._seq = len(self._chunks)
+
+    def _import_legacy_json(self, directory: Path) -> None:
+        """Read (never write) a pre-0.4 `<collection>.chroma.json` file, if one exists."""
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
+        legacy = directory / f"{safe_name}.chroma.json"
+        if not legacy.exists():
+            return
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            for item in data.get("items", []):
+                self._chunks.append(Chunk(**item["chunk"]))
+                self._embeddings.append(item["embedding"])
+            self._seq = len(self._chunks)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ writes
+
+    def add(
+        self,
+        chunks: list[Chunk],
+        embeddings: list[list[float]] | None = None,
+        auto_save: bool = True,
+    ) -> int:
+        """
+        Insert or update chunks (auto-embeds them when `embeddings` is omitted).
+
+        With `persist_dir`, all rows are written in a single SQLite transaction. Pass
+        `auto_save=False` inside bulk loops and call `save()` once at the end.
+        """
         global _LAST_ACTIVE_STORE
         _LAST_ACTIVE_STORE = self
         if not chunks:
@@ -287,31 +467,56 @@ class VectorStore:
         if embeddings is None:
             from ragspark import embedder as embedder_mod
 
-            dim = len(self._embeddings[0]) if self._embeddings else self.embed_dimension
-            embeddings = embedder_mod.embed(
+            embeddings, used = embedder_mod.embed_with_provider(
                 chunks,
                 provider=self.embed_provider,
                 strategy=self.embed_strategy,
                 model=self.embed_model,
                 api_key=self.embed_api_key,
-                dimension=dim,
+                dimension=self._dimension(),
             )
+            self.embed_provider = used  # pin it so query vectors come from the same model
         if len(chunks) != len(embeddings):
             raise ValueError(f"Count mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings.")
 
         existing_index_by_id = {c.id: i for i, c in enumerate(self._chunks)}
+        new_rows: list[tuple[int, Chunk, list[float]]] = []
         for chk, emb in zip(chunks, embeddings):
+            emb = list(emb) if emb is not None else []
             if chk.id in existing_index_by_id:
                 pos = existing_index_by_id[chk.id]
                 self._chunks[pos] = chk
-                self._embeddings[pos] = emb
+                if self._spill is None:
+                    self._embeddings[pos] = emb
+                new_rows.append((pos, chk, emb))
             else:
+                pos = self._seq
+                self._seq += 1
                 existing_index_by_id[chk.id] = len(self._chunks)
                 self._chunks.append(chk)
-                self._embeddings.append(emb)
+                if self._spill is None:
+                    self._embeddings.append(emb)
+                new_rows.append((pos, chk, emb))
 
-        if self._backend_name == "chromadb_native" and self._native_backend is not None:
-            try:
+        if self._spill is not None:
+            self._spill.upsert(new_rows)
+
+        self._write_native(chunks, embeddings)
+
+        if self._sqlite is not None:
+            self._pending.extend(new_rows)
+            if auto_save:
+                self.save()
+        elif self._spill is None and len(self._chunks) > SPILL_THRESHOLD:
+            self._spill_to_tempdir()
+
+        return len(chunks)
+
+    def _write_native(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+        if self._native_backend is None:
+            return
+        try:
+            if self._backend_name == "chromadb_native" and all(embeddings):
                 self._native_backend.upsert(
                     ids=[c.id for c in chunks],
                     documents=[c.text for c in chunks],
@@ -326,44 +531,88 @@ class VectorStore:
                         for c in chunks
                     ],
                 )
-            except Exception:
-                pass
-        elif self._backend_name == "pinecone_native" and self._native_backend is not None:
-            try:
-                vectors = [
-                    {
-                        "id": c.id,
-                        "values": emb,
-                        "metadata": {"text": c.text, "source": c.source, "section_path": c.section_path, "page": c.page_number, "strategy": c.strategy},
-                    }
-                    for c, emb in zip(chunks, embeddings)
-                ]
-                self._native_backend.upsert(vectors=vectors)
-            except Exception:
-                pass
-        elif self._backend_name == "mongodb_native" and self._native_backend is not None:
-            try:
-                docs = [
-                    {
-                        "_id": c.id,
-                        "text": c.text,
-                        "embedding": emb,
-                        "source": c.source,
-                        "page_number": c.page_number,
-                        "section_path": c.section_path,
-                        "strategy": c.strategy,
-                        "metadata": c.metadata,
-                    }
-                    for c, emb in zip(chunks, embeddings)
-                ]
-                self._native_backend.insert_many(docs, ordered=False)
-            except Exception:
-                pass
+            elif self._backend_name == "pinecone_native" and all(embeddings):
+                self._native_backend.upsert(
+                    vectors=[
+                        {
+                            "id": c.id,
+                            "values": emb,
+                            "metadata": {"text": c.text, "source": c.source, "section_path": c.section_path, "page": c.page_number, "strategy": c.strategy},
+                        }
+                        for c, emb in zip(chunks, embeddings)
+                    ]
+                )
+            elif self._backend_name == "mongodb_native":
+                self._native_backend.insert_many(
+                    [
+                        {
+                            "_id": c.id,
+                            "text": c.text,
+                            "embedding": emb,
+                            "source": c.source,
+                            "page_number": c.page_number,
+                            "section_path": c.section_path,
+                            "strategy": c.strategy,
+                            "metadata": c.metadata,
+                        }
+                        for c, emb in zip(chunks, embeddings)
+                    ],
+                    ordered=False,
+                )
+        except Exception:
+            pass
 
-        if self.provider != "memory":
-            self._save_local_persistence()
+    def _spill_to_tempdir(self) -> None:
+        """Move embeddings out of RAM into a SQLite file in the OS temp dir (never the CWD)."""
+        spill_dir = Path(tempfile.gettempdir()) / "ragspark"
+        path = spill_dir / f"spill-{os.getpid()}-{uuid.uuid4().hex[:12]}.db"
+        store = _SQLiteStore(path, self.collection_name)
+        store.upsert([(i, c, e) for i, (c, e) in enumerate(zip(self._chunks, self._embeddings))])
+        self._spill = store
+        self._embeddings = []
+        self._spill_finalizer = weakref.finalize(self, store.destroy)
 
-        return len(chunks)
+    def save(self) -> None:
+        """Flush pending writes to `persist_dir` in one transaction (no-op for pure in-memory stores)."""
+        if self._sqlite is None or not self._pending:
+            return
+        self._sqlite.upsert(
+            self._pending,
+            meta={
+                "embed_provider": str(self.embed_provider),
+                "embed_model": str(self.embed_model or ""),
+                "embed_strategy": str(self.embed_strategy),
+            },
+        )
+        self._pending = []
+
+    def close(self) -> None:
+        """Flush pending writes and delete any temp-dir spill file."""
+        self.save()
+        if self._spill is not None:
+            self._spill_finalizer()
+            self._spill = None
+
+    def __len__(self) -> int:
+        """Return the number of stored chunks."""
+        return len(self._chunks)
+
+    # ------------------------------------------------------------------ reads
+
+    def _dimension(self) -> int:
+        if self._embeddings and self._embeddings[0]:
+            return len(self._embeddings[0])
+        return self.embed_dimension
+
+    def _iter_embeddings(self) -> Iterator[list[float]]:
+        if self._spill is not None:
+            return self._spill.iter_embeddings()
+        return iter(self._embeddings)
+
+    def _has_vectors(self) -> bool:
+        if self._spill is not None:
+            return next(self._spill.iter_embeddings(batch=1), []) != []
+        return bool(self._embeddings) and bool(self._embeddings[0])
 
     def search(
         self,
@@ -388,6 +637,9 @@ class VectorStore:
           - `strategy="rerank"`: 2-Stage Hybrid Retrieval + Cross-Feature Phrase & Legal Hierarchy Reranker
           - `strategy="multi_query"`: Generates structural/synonym query expansions and fuses via RRF
           - `chunk_strategy_filter`: Optional chunking strategy filter (e.g. `"legal_clause"` or `["recursive", "semantic"]`)
+
+        When the collection has no vectors (lexical embedder) or the query cannot be embedded,
+        every strategy degrades to BM25 keyword scoring instead of failing.
         """
         if not self._chunks:
             return []
@@ -399,24 +651,31 @@ class VectorStore:
         if query and not query_text:
             query_text = query
 
-        if query_embedding is None:
-            from ragspark import embedder as embedder_mod
-
-            dim = len(self._embeddings[0]) if self._embeddings else self.embed_dimension
-            query_embedding = embedder_mod.embed_query(
-                query_text or "",
-                provider=self.embed_provider,
-                strategy=self.embed_strategy,
-                model=self.embed_model,
-                api_key=self.embed_api_key,
-                dimension=dim,
-            )
-
         strat = strategy.lower().strip()
         if strat not in AVAILABLE_RETRIEVAL_STRATEGIES:
             raise ValueError(f"Unknown retrieval strategy '{strategy}'. Choose from: {AVAILABLE_RETRIEVAL_STRATEGIES}")
 
-        # Filter candidate chunks if user is experimenting with specific chunking strategies in ChromaDB
+        has_vectors = self._has_vectors()
+        if query_embedding is None and has_vectors:
+            try:
+                from ragspark import embedder as embedder_mod
+
+                query_embedding = embedder_mod.embed_query(
+                    query_text or "",
+                    provider=self.embed_provider,
+                    strategy=self.embed_strategy,
+                    model=self.embed_model,
+                    api_key=self.embed_api_key,
+                    dimension=self._dimension(),
+                )
+            except Exception:
+                query_embedding = []
+        lexical = not has_vectors or not query_embedding or len(query_embedding) != self._dimension()
+        if lexical:
+            query_embedding = []
+            if strat == "semantic":
+                strat = "bm25"
+
         allowed_strats: set[str] | None = None
         if chunk_strategy_filter:
             if isinstance(chunk_strategy_filter, str):
@@ -424,38 +683,29 @@ class VectorStore:
             else:
                 allowed_strats = {str(s).strip().lower() for s in chunk_strategy_filter}
 
-        candidates: list[tuple[Chunk, list[float]]] = []
-        for chk, emb in zip(self._chunks, self._embeddings):
-            if allowed_strats and chk.strategy.lower() not in allowed_strats:
-                continue
-            candidates.append((chk, emb))
-
+        candidates = [
+            c for c in self._chunks if not allowed_strats or c.strategy.lower() in allowed_strats
+        ]
         if not candidates:
             return []
+        avg_len = sum(len(c.text.split()) for c in candidates) / max(1, len(candidates))
+        keep_emb = strat == "mmr"
 
-        avg_len = sum(len(c.text.split()) for c, _ in candidates) / max(1, len(candidates))
-
-        # Compute base vector and keyword scores for all candidates
         raw_items: list[dict[str, Any]] = []
-        for idx, (chk, emb) in enumerate(candidates):
-            v_score = max(0.0, _cosine_similarity(query_embedding, emb))
+        for idx, (chk, emb) in enumerate(zip(self._chunks, self._iter_embeddings())):
+            if allowed_strats and chk.strategy.lower() not in allowed_strats:
+                continue
+            v_score = 0.0 if lexical else max(0.0, _cosine_similarity(query_embedding, emb))  # type: ignore[arg-type]
             k_score = _bm25_keyword_score(query_text, chk, avg_doc_len=avg_len) if query_text else 0.0
-
-            # Multi-query expansion boost
             if strat == "multi_query" and query_text:
                 expanded_q = f"{query_text} section clause proviso obligation rule definition"
                 k_exp = _bm25_keyword_score(expanded_q, chk, avg_doc_len=avg_len)
                 k_score = max(k_score, (k_score * 0.7) + (k_exp * 0.3))
-
             raw_items.append(
-                {
-                    "idx": idx,
-                    "chunk": chk,
-                    "emb": emb,
-                    "v_score": v_score,
-                    "k_score": k_score,
-                }
+                {"idx": idx, "chunk": chk, "emb": emb if keep_emb else None, "v_score": v_score, "k_score": k_score}
             )
+
+        alpha = 0.0 if lexical else hybrid_alpha
 
         if strat == "semantic":
             for it in raw_items:
@@ -468,32 +718,30 @@ class VectorStore:
                 it["rerank"] = 0.0
 
         elif strat in ("rrf", "multi_query"):
-            # Sort by vector score and keyword score separately to compute RRF ranks
             by_vec = sorted(raw_items, key=lambda x: x["v_score"], reverse=True)
             by_kw = sorted(raw_items, key=lambda x: x["k_score"], reverse=True)
             vec_rank = {it["idx"]: r for r, it in enumerate(by_vec, start=1)}
             kw_rank = {it["idx"]: r for r, it in enumerate(by_kw, start=1)}
             for it in raw_items:
-                rrf_val = (1.0 / (10.0 + vec_rank[it["idx"]])) + (1.0 / (10.0 + kw_rank[it["idx"]]))
-                it["final"] = rrf_val * 5.0  # Scale to ~[0, 1]
+                vec_part = 0.0 if lexical else 1.0 / (10.0 + vec_rank[it["idx"]])
+                rrf_val = vec_part + (1.0 / (10.0 + kw_rank[it["idx"]]))
+                it["final"] = rrf_val * (10.0 if lexical else 5.0)  # Scale to ~[0, 1]
                 it["rerank"] = 0.0
 
         elif strat == "mmr":
-            # Maximal Marginal Relevance greedy selection
             for it in raw_items:
-                it["base"] = (hybrid_alpha * it["v_score"]) + ((1.0 - hybrid_alpha) * it["k_score"])
+                it["base"] = (alpha * it["v_score"]) + ((1.0 - alpha) * it["k_score"])
+            # MMR is quadratic: run it over the strongest candidates only.
+            pool = sorted(raw_items, key=lambda x: x["base"], reverse=True)[: max(50, top_k * 5)]
             selected: list[dict[str, Any]] = []
-            remaining = list(raw_items)
-            while remaining and len(selected) < max(1, top_k):
+            while pool and len(selected) < max(1, top_k):
                 best_item = None
                 best_mmr = -1e9
-                for cand in remaining:
-                    max_sim_to_selected = (
-                        max(_cosine_similarity(cand["emb"], sel["emb"]) for sel in selected)
-                        if selected
-                        else 0.0
+                for cand in pool:
+                    max_sim = (
+                        max(_cosine_similarity(cand["emb"], sel["emb"]) for sel in selected) if selected else 0.0
                     )
-                    mmr_score = (mmr_lambda * cand["base"]) - ((1.0 - mmr_lambda) * max_sim_to_selected)
+                    mmr_score = (mmr_lambda * cand["base"]) - ((1.0 - mmr_lambda) * max_sim)
                     if mmr_score > best_mmr:
                         best_mmr = mmr_score
                         best_item = cand
@@ -502,32 +750,28 @@ class VectorStore:
                 best_item["final"] = max(0.0, best_mmr)
                 best_item["rerank"] = 0.0
                 selected.append(best_item)
-                remaining.remove(best_item)
+                pool.remove(best_item)
             raw_items = selected
 
         elif strat == "rerank":
             for it in raw_items:
-                base_h = (hybrid_alpha * it["v_score"]) + ((1.0 - hybrid_alpha) * it["k_score"])
+                base_h = (alpha * it["v_score"]) + ((1.0 - alpha) * it["k_score"])
                 rr = _cross_feature_rerank_score(query_text, it["chunk"], base_h)
                 it["rerank"] = rr
                 it["final"] = rr
 
-        else:
-            # Default: "hybrid"
+        else:  # "hybrid"
             for it in raw_items:
                 it["final"] = (
-                    (hybrid_alpha * it["v_score"]) + ((1.0 - hybrid_alpha) * it["k_score"])
-                    if query_text
-                    else it["v_score"]
+                    (alpha * it["v_score"]) + ((1.0 - alpha) * it["k_score"]) if query_text else it["v_score"]
                 )
                 it["rerank"] = 0.0
 
         if strat != "mmr":
             raw_items.sort(key=lambda x: x["final"], reverse=True)
 
-        top_slice = raw_items[: max(1, top_k)]
         results: list[SearchResult] = []
-        for rank_idx, it in enumerate(top_slice, start=1):
+        for rank_idx, it in enumerate(raw_items[: max(1, top_k)], start=1):
             results.append(
                 SearchResult(
                     chunk=it["chunk"],
@@ -555,12 +799,7 @@ class VectorStore:
             top_k: Number of top results to return.
             alpha: Weight balancing factor (1.0 = pure vector, 0.0 = pure BM25 keyword, default=0.65).
         """
-        return self.search(
-            query=query,
-            top_k=top_k,
-            strategy="hybrid",
-            hybrid_alpha=alpha,
-        )
+        return self.search(query=query, top_k=top_k, strategy="hybrid", hybrid_alpha=alpha)
 
     def list_indexed_strategies(self) -> list[str]:
         """Return the distinct chunking strategies currently stored in this VectorDB collection."""
@@ -569,55 +808,22 @@ class VectorStore:
     def count(self) -> int:
         return len(self._chunks)
 
-    def _save_local_persistence(self) -> None:
-        target_dir = self.persist_directory or Path(".ragspark_store")
-        try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
-            store_file = target_dir / f"{safe_name}.chroma.json"
-            payload = {
-                "collection_name": self.collection_name,
-                "provider": self.provider,
-                "items": [
-                    {"chunk": c.to_dict(), "embedding": e}
-                    for c, e in zip(self._chunks, self._embeddings)
-                ],
-            }
-            store_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            (target_dir / "_last_active.txt").write_text(str(store_file.resolve()), encoding="utf-8")
-        except Exception:
-            pass
-
-    def _load_local_persistence(self) -> None:
-        target_dir = self.persist_directory or Path(".ragspark_store")
-        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.collection_name) or "raglib_collection"
-        store_file = target_dir / f"{safe_name}.chroma.json"
-        if not store_file.exists():
-            return
-        try:
-            data = json.loads(store_file.read_text(encoding="utf-8"))
-            for item in data.get("items", []):
-                c_dict = item["chunk"]
-                self._chunks.append(Chunk(**c_dict))
-                self._embeddings.append(item["embedding"])
-        except Exception:
-            pass
-
 
 def connect(
-    provider: str = "chroma",
-    collection_name: str = "raglib_collection",
+    provider: str = "memory",
+    collection_name: str = "ragspark_collection",
     persist_directory: str | Path | None = None,
     api_key: str | None = None,
     connection_uri: str | None = None,
     backend: str | None = None,
+    persist_dir: str | Path | None = None,
     **kwargs: Any,
 ) -> VectorStore:
-    """Connect to or create a VectorDB store (default: ChromaDB). Automatically reloads persisted chunks if present."""
+    """Connect to or create a VectorDB store (default: in-memory). Reloads persisted chunks when `persist_dir` is given."""
     return VectorStore(
         provider=backend or provider,
         collection_name=collection_name,
-        persist_directory=persist_directory,
+        persist_directory=persist_dir if persist_dir is not None else persist_directory,
         api_key=api_key,
         connection_uri=connection_uri,
         **kwargs,
@@ -625,59 +831,66 @@ def connect(
 
 
 def load(
-    collection_name: str = "raglib_collection",
+    collection_name: str = "ragspark_collection",
     persist_directory: str | Path | None = None,
-    provider: str = "chroma",
+    provider: str = "memory",
+    persist_dir: str | Path | None = None,
     **kwargs: Any,
 ) -> VectorStore:
     """
-    Reload an already-indexed VectorDB collection from disk in <0.05s without re-running Parser, Chunker, or Embedder!
-    If `collection_name` is omitted, loads the most recently saved collection from `.ragspark_store`.
+    Reload an already-indexed collection from `persist_dir` without re-running parsing, chunking or embedding.
+
+    Without `persist_dir`: a pre-0.4 `.ragspark_store` folder in the working directory is read into
+    memory (nothing is written there); failing that, the store already active in this session is
+    returned (handy after re-running a notebook cell).
     """
-    target_dir = Path(persist_directory) if persist_directory else Path(".ragspark_store")
-    if collection_name == "raglib_collection" and not (target_dir / "raglib_collection.chroma.json").exists():
-        last_ptr = target_dir / "_last_active.txt"
-        if last_ptr.exists():
+    target = persist_dir if persist_dir is not None else persist_directory
+    if target is not None:
+        return VectorStore(provider=provider, collection_name=collection_name, persist_directory=target, **kwargs)
+
+    if _LEGACY_STORE_DIR.is_dir():
+        last_ptr = _LEGACY_STORE_DIR / "_last_active.txt"
+        if collection_name == "ragspark_collection" and last_ptr.exists():
             try:
-                saved_path = Path(last_ptr.read_text(encoding="utf-8").strip())
-                if saved_path.exists() and saved_path.name.endswith(".chroma.json"):
-                    collection_name = saved_path.name[: -len(".chroma.json")]
-                    target_dir = saved_path.parent
+                saved = Path(last_ptr.read_text(encoding="utf-8").strip())
+                if saved.name.endswith(".chroma.json"):
+                    collection_name = saved.name[: -len(".chroma.json")]
             except Exception:
                 pass
-    return VectorStore(
-        provider=provider,
-        collection_name=collection_name,
-        persist_directory=target_dir,
-        **kwargs,
-    )
+        legacy = VectorStore(provider=provider, collection_name=collection_name, **kwargs)
+        legacy._import_legacy_json(_LEGACY_STORE_DIR)  # read-only
+        if len(legacy):
+            return legacy
+    if _LAST_ACTIVE_STORE is not None:
+        return _LAST_ACTIVE_STORE
+    raise ValueError("vectordb.load() needs `persist_dir=` (the folder passed when the collection was built).")
 
 
 def store(
     chunks: list[Chunk],
     embeddings: list[list[float]] | None = None,
-    provider: str = "chroma",
+    provider: str = "memory",
     backend: str | None = None,
-    collection_name: str = "raglib_collection",
+    collection_name: str = "ragspark_collection",
     persist_directory: str | Path | None = None,
     api_key: str | None = None,
     connection_uri: str | None = None,
-    embed_provider: str = "fast_local",
+    embed_provider: str = "auto",
     embed_strategy: str = "dense",
     embed_model: str | None = None,
     embed_api_key: str | None = None,
     embed_dimension: int = 384,
+    persist_dir: str | Path | None = None,
     **kwargs: Any,
 ) -> VectorStore:
     """
-    One-command VectorDB indexer (`vectordb.store(chunks, backend='chroma', collection_name='my_docs')`):
-    Connects to the chosen VectorDB, automatically embeds `chunks` if `embeddings` is not provided,
-    stores them (and persists to disk), and returns the ready-to-search `VectorStore`.
+    One-command indexer: `vectordb.store(chunks)` embeds `chunks` (unless `embeddings` is given),
+    stores them in memory (or in `persist_dir`), and returns the ready-to-search `VectorStore`.
     """
     db = VectorStore(
         provider=backend or provider,
         collection_name=collection_name,
-        persist_directory=persist_directory,
+        persist_directory=persist_dir if persist_dir is not None else persist_directory,
         api_key=api_key,
         connection_uri=connection_uri,
         embed_provider=embed_provider,
@@ -701,4 +914,5 @@ __all__ = [
     "list_retrieval_strategies",
     "AVAILABLE_VECTORDBS",
     "AVAILABLE_RETRIEVAL_STRATEGIES",
+    "SPILL_THRESHOLD",
 ]

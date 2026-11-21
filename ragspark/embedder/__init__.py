@@ -1,26 +1,28 @@
 """
-`ragspark.embedder` — Production Multi-Strategy & Multi-Provider Embedding Engine.
+`ragspark.embedder` — Multi-Provider Embedding Engine with a never-crash fallback ladder.
 
-Supports:
-  1. Embedding Providers (`provider=`):
-     - "fast_local"            (Default: zero-GPU, instant CPU feature-hashing embedder)
-     - "ollama"                (Local Ollama embedding runtime: nomic-embed-text, mxbai-embed-large, bge-m3)
-     - "gemini"                (Google Gemini Embedding API: text-embedding-004, gemini-embedding-001)
-     - "openai"                (OpenAI Embedding API: text-embedding-3-small, text-embedding-3-large)
-     - "sentence_transformers" (HuggingFace local models: all-MiniLM-L6-v2, BAAI/bge-small-en-v1.5, legal-bert)
-  2. Embedding Strategies (`strategy=`):
-     - "dense"                 (Standard semantic representation)
-     - "hybrid_sparse_dense"   (Fuses dense semantic dims + exact lexical/identifier dims)
-     - "legal_domain_boost"    (Amplifies statutory sections, Articles, Clauses, Case Citations, and defined terms)
-     - "context_enriched"      (Prepends `[Source | Page | Section Path]` metadata into the text before embedding!)
-  3. Custom User Embedding Functions:
-     - `embedder.register_custom("my_embedder", fn)`
+Default provider `"auto"` walks this ladder and uses the first rung that works:
+  1. `"onnx"`   — local quantized ONNX model via `fastembed` (BAAI/bge-small-en-v1.5), if installed
+                  (`pip install ragspark[onnx]`). Runs on CPU, no API key, no data leaves the machine.
+  2. Cloud API  — `"gemini"` (GEMINI_API_KEY / GOOGLE_API_KEY) then `"openai"` (OPENAI_API_KEY).
+                  Groq does not offer an embeddings endpoint, so it is not a rung.
+  3. `"lexical"` — no vectors at all; the vector store switches to pure BM25 keyword retrieval.
+Set `RAGSPARK_EMBED_PROVIDER` to pin a rung (e.g. `lexical` for offline tests).
+
+Other providers: `"ollama"`, `"sentence_transformers"` / `"huggingface"`, custom functions via
+`embedder.register_custom("name", fn)`.
+
+`"fast_local"` is feature hashing, kept only for backward compatibility. It is NOT a semantic
+embedding model and is never chosen automatically.
+
+Embedding strategies (`strategy=`): "dense", "hybrid_sparse_dense", "legal_domain_boost", "context_enriched".
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -29,7 +31,12 @@ from typing import Any, Callable
 
 from ragspark.chunker import Chunk
 
+_log = logging.getLogger("ragspark.embedder")
+
 AVAILABLE_PROVIDERS = (
+    "auto",
+    "onnx",
+    "lexical",
     "fast_local",
     "ollama",
     "gemini",
@@ -46,6 +53,35 @@ AVAILABLE_EMBED_STRATEGIES = (
 )
 
 CUSTOM_EMBEDDERS: dict[str, Callable[[list[str], int], list[list[float]]]] = {}
+
+DEFAULT_ONNX_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_GEMINI_EMBED_MODEL = "gemini-embedding-001"
+DEFAULT_OPENAI_EMBED_MODEL = "text-embedding-3-small"
+
+
+def _has_module(name: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def auto_chain(api_key: str | None = None) -> list[str]:
+    """Return the providers the `"auto"` ladder will try, in order (always ends with `"lexical"`)."""
+    pinned = os.environ.get("RAGSPARK_EMBED_PROVIDER", "").strip().lower()
+    if pinned and pinned != "auto":
+        return [pinned] if pinned == "lexical" else [pinned, "lexical"]
+    chain: list[str] = []
+    if _has_module("fastembed"):
+        chain.append("onnx")
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or (api_key or "").startswith("AIza"):
+        chain.append("gemini")
+    if os.environ.get("OPENAI_API_KEY") or (api_key or "").startswith("sk-"):
+        chain.append("openai")
+    chain.append("lexical")
+    return chain
 
 
 def list_providers() -> list[str]:
@@ -129,6 +165,9 @@ class SmartEmbedder:
         self.dimension = dimension
         self._st_model: Any = None
         self._st_model_name: str | None = None
+        self._onnx_model: Any = None
+        self._onnx_model_name: str | None = None
+        self.last_provider: str | None = None
 
     def embed(
         self,
@@ -139,6 +178,7 @@ class SmartEmbedder:
         api_key: str | None = None,
         base_url: str | None = None,
         dimension: int | None = None,
+        is_query: bool = False,
     ) -> list[list[float]]:
         """Embed a list of `Chunk` objects, a list of strings, or a single string using the chosen provider & strategy."""
         prov = (provider or self.provider).lower().strip()
@@ -169,16 +209,48 @@ class SmartEmbedder:
         if not texts:
             return []
 
+        if prov == "auto":
+            last_exc: Exception | None = None
+            for rung in auto_chain(key):
+                try:
+                    vectors = self._embed_texts(texts, rung, strat, mdl, key, url, dim, is_query)
+                    self.last_provider = rung
+                    return vectors
+                except Exception as exc:  # never crash: fall to the next rung
+                    last_exc = exc
+                    _log.warning("ragspark embedder: provider %r failed (%s); trying next fallback", rung, type(exc).__name__)
+            self.last_provider = "lexical"
+            _log.warning("ragspark embedder: all providers failed (%s); using lexical BM25", type(last_exc).__name__)
+            return [[] for _ in texts]
+
+        self.last_provider = prov
+        return self._embed_texts(texts, prov, strat, mdl, key, url, dim, is_query)
+
+    def _embed_texts(
+        self,
+        texts: list[str],
+        prov: str,
+        strat: str,
+        mdl: str | None,
+        key: str | None,
+        url: str | None,
+        dim: int,
+        is_query: bool = False,
+    ) -> list[list[float]]:
+        if prov == "lexical":
+            return [[] for _ in texts]
         if prov in CUSTOM_EMBEDDERS:
             return CUSTOM_EMBEDDERS[prov](texts, dim)
+        if prov == "onnx":
+            return self._embed_onnx(texts, model=mdl or DEFAULT_ONNX_MODEL, is_query=is_query)
         if prov == "fast_local":
             return [_fast_local_embed_one(t, dim=dim, strategy=strat) for t in texts]
         if prov == "ollama":
             return self._embed_ollama(texts, model=mdl or "nomic-embed-text", base_url=url or "http://localhost:11434")
         if prov == "gemini":
-            return self._embed_gemini(texts, model=mdl or "text-embedding-004", api_key=key)
+            return self._embed_gemini(texts, model=mdl or DEFAULT_GEMINI_EMBED_MODEL, api_key=key, is_query=is_query)
         if prov == "openai":
-            return self._embed_openai(texts, model=mdl or "text-embedding-3-small", api_key=key, base_url=url)
+            return self._embed_openai(texts, model=mdl or DEFAULT_OPENAI_EMBED_MODEL, api_key=key, base_url=url)
         if prov in ("sentence_transformers", "huggingface"):
             return self._embed_sentence_transformers(texts, model=mdl or "all-MiniLM-L6-v2")
 
@@ -203,8 +275,20 @@ class SmartEmbedder:
             api_key=api_key,
             base_url=base_url,
             dimension=dimension,
+            is_query=True,
         )
         return res[0] if res else []
+
+    def _embed_onnx(self, texts: list[str], model: str, is_query: bool = False) -> list[list[float]]:
+        """Quantized ONNX embeddings on CPU via `fastembed` (`pip install ragspark[onnx]`)."""
+        from fastembed import TextEmbedding  # type: ignore[import-not-found]
+
+        if self._onnx_model is None or self._onnx_model_name != model:
+            self._onnx_model = TextEmbedding(model_name=model)
+            self._onnx_model_name = model
+        fn = getattr(self._onnx_model, "query_embed", None) if is_query else None
+        vectors = (fn or self._onnx_model.embed)(texts)
+        return [[float(x) for x in v] for v in vectors]
 
     def _embed_ollama(self, texts: list[str], model: str, base_url: str) -> list[list[float]]:
         endpoint = f"{base_url.rstrip('/')}/api/embed"
@@ -227,30 +311,36 @@ class SmartEmbedder:
             return vectors
         raise RuntimeError(f"Failed to retrieve embeddings from Ollama at {base_url}")
 
-    def _embed_gemini(self, texts: list[str], model: str, api_key: str | None) -> list[list[float]]:
-        key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    def _embed_gemini(self, texts: list[str], model: str, api_key: str | None, is_query: bool = False) -> list[list[float]]:
+        key = (api_key if (api_key or "").startswith("AIza") else None) or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not key:
             raise ValueError("Gemini API key required. Pass `api_key='...'` or set GEMINI_API_KEY environment variable.")
         model_path = model if model.startswith("models/") else f"models/{model}"
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:batchEmbedContents?key={key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:batchEmbedContents"
+        task = "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT"
         all_vectors: list[list[float]] = []
         # Google Gemini batchEmbedContents allows at most 100 texts per batch request
         batch_size = 100
         for start in range(0, len(texts), batch_size):
             batch_texts = texts[start : start + batch_size]
-            requests_list = [
-                {"model": model_path, "content": {"parts": [{"text": t}]}}
-                for t in batch_texts
-            ]
+            requests_list = []
+            for t in batch_texts:
+                item: dict[str, Any] = {"model": model_path, "content": {"parts": [{"text": t}]}, "taskType": task}
+                if "gemini-embedding" in model_path:
+                    item["outputDimensionality"] = 768
+                requests_list.append(item)
             payload = json.dumps({"requests": requests_list}).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            # Key goes in a header, never in the URL, so it cannot leak into logs or tracebacks.
+            req = urllib.request.Request(
+                url, data=payload, headers={"Content-Type": "application/json", "x-goog-api-key": key}
+            )
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 all_vectors.extend(item["values"] for item in data.get("embeddings", []))
         return all_vectors
 
     def _embed_openai(self, texts: list[str], model: str, api_key: str | None, base_url: str | None) -> list[list[float]]:
-        key = api_key or os.environ.get("OPENAI_API_KEY")
+        key = (api_key if (api_key or "").startswith("sk-") else None) or os.environ.get("OPENAI_API_KEY")
         if not key:
             raise ValueError("OpenAI API key required. Pass `api_key='...'` or set OPENAI_API_KEY environment variable.")
         url = f"{(base_url or 'https://api.openai.com/v1').rstrip('/')}/embeddings"
@@ -283,14 +373,14 @@ default_embedder = SmartEmbedder()
 
 def embed(
     items: list[Chunk] | list[str] | str,
-    provider: str = "fast_local",
+    provider: str = "auto",
     strategy: str = "dense",
     model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     dimension: int = 384,
 ) -> list[list[float]]:
-    """One-command embedding function supporting user-selectable `provider` and `strategy`."""
+    """One-command embedding. `provider="auto"` uses the ONNX -> cloud -> lexical ladder (see module docs)."""
     return default_embedder.embed(
         items=items,
         provider=provider,
@@ -304,7 +394,7 @@ def embed(
 
 def embed_query(
     query: str,
-    provider: str = "fast_local",
+    provider: str = "auto",
     strategy: str = "dense",
     model: str | None = None,
     api_key: str | None = None,
@@ -323,8 +413,26 @@ def embed_query(
     )
 
 
+def embed_with_provider(
+    items: list[Chunk] | list[str] | str,
+    provider: str = "auto",
+    strategy: str = "dense",
+    model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    dimension: int = 384,
+) -> tuple[list[list[float]], str]:
+    """Like `embed`, but also returns the provider that actually produced the vectors."""
+    vectors = default_embedder.embed(
+        items, provider=provider, strategy=strategy, model=model, api_key=api_key, base_url=base_url, dimension=dimension
+    )
+    return vectors, default_embedder.last_provider or provider
+
+
 __all__ = [
     "SmartEmbedder",
+    "auto_chain",
+    "embed_with_provider",
     "embed",
     "embed_query",
     "register_custom",

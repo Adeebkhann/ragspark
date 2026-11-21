@@ -1,11 +1,19 @@
 """
 `ragspark.rag` — Production General & Specialized Law RAG Pipeline Engine + Experimentation Suite.
 
+Three-line quick start:
+    import ragspark
+    bot = ragspark.pipeline("constitution.pdf", llm="groq")      # GROQ_API_KEY from the environment
+    print(bot.ask("What does Article 21 protect?"))
+
+Defaults: natural-boundary chunking, `auto` embeddings (ONNX -> cloud -> BM25), in-memory store
+(no files written unless `persist_dir=` is passed), TOC/gazette noise filtered before indexing.
+
 Supports:
   - Single or Combined Chunking Strategies (`chunk_strategy="recursive"` or `["legal_clause", "semantic"]`)
   - Selectable Embedding Provider (`embed_provider`) + Embedding Strategy (`embed_strategy="legal_domain_boost"`)
   - Selectable Retrieval Technique (`retrieval_strategy="hybrid"`, `"semantic"`, `"bm25"`, `"rrf"`, `"mmr"`, `"rerank"`, `"multi_query"`)
-  - Selectable VectorDB (`vectordb="chroma"` default, `"pinecone"`, `"mongodb"`, `"qdrant"`, `"memory"`)
+  - Selectable VectorDB (`vectordb="memory"` default, `"sqlite"`, `"chroma"`, `"pinecone"`, `"mongodb"`, `"qdrant"`)
   - Selectable Prompt Engineering Technique + Custom `system_prompt`
   - Selectable LLM Runtime (`"gemini 3.8 flash"`, `"claude sonnet 5.5"`, `"gpt 4o"`, `"llama 3.2"`, `"extractive"`)
 """
@@ -33,7 +41,9 @@ def _extract_sentence_evidence(query: str, text: str) -> str:
     """Extract the most relevant sentence from text matching query terms."""
     if not text:
         return ""
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 10]
+    from ragspark.llm import split_sentences
+
+    sentences = [s for s in split_sentences(text) if len(s) > 10]
     if not sentences:
         clean = text.strip()
         return clean[:180] + ("..." if len(clean) > 180 else "")
@@ -63,7 +73,7 @@ class RAGResponse:
     built_prompt: BuiltPrompt
     mode: str = "general"
     llm_provider: str = "extractive"
-    vectordb_provider: str = "chroma"
+    vectordb_provider: str = "memory"
     retrieval_strategy: str = "hybrid"
     rewritten_query: str = ""
     is_story: bool = False
@@ -145,7 +155,7 @@ class RAGPipeline:
         chunks: list[Chunk],
         store: VectorStore,
         mode: str = "general",
-        embed_provider: str = "fast_local",
+        embed_provider: str = "auto",
         embed_strategy: str = "dense",
         embed_model: str | None = None,
         embed_api_key: str | None = None,
@@ -159,6 +169,7 @@ class RAGPipeline:
         system_prompt: str | None = None,
         rewrite_queries: bool = True,
         language: str | None = None,
+        max_history_turns: int = 6,
     ) -> None:
         self.document = document
         self.chunks = chunks
@@ -178,6 +189,7 @@ class RAGPipeline:
         self.system_prompt = system_prompt
         self.rewrite_queries = rewrite_queries
         self.language = language
+        self.max_history_turns = max_history_turns
         self.history: list[dict[str, str]] = []
 
     def rewrite_query(self, query: str) -> prompt_mod.QueryRewriteResult:
@@ -204,18 +216,12 @@ class RAGPipeline:
         use_rewrite = self.rewrite_queries if rewrite is None else rewrite
         search_query = str(self.rewrite_query(query)) if use_rewrite else query
 
-        q_vec = embedder_mod.embed_query(
-            search_query,
-            provider=self.embed_provider,
-            strategy=self.embed_strategy,
-            model=self.embed_model,
-            api_key=self.embed_api_key,
-            dimension=self.embed_dimension,
-        )
         ret_strat = retrieval_strategy or self.retrieval_strategy
         fetch_k = top_k * 2 if rerank else top_k
+        # The store embeds the query with the same provider that embedded the chunks,
+        # and degrades to BM25 if that provider is unavailable.
         hits = self.store.search(
-            query_embedding=q_vec,
+            query_embedding=None,
             query_text=search_query,
             top_k=fetch_k,
             strategy=ret_strat,
@@ -250,8 +256,12 @@ class RAGPipeline:
         api_key: str | None = None,
         base_url: str | None = None,
         rewrite: bool | None = None,
+        history: list[dict[str, str]] | None = None,
+        retrieval_query: str | None = None,
     ) -> RAGResponse:
         """
+        0. `history` (list of {"role", "content"}) is shown to the LLM as conversation memory;
+           `retrieval_query` overrides the text used for search (e.g. a condensed follow-up).
         1. Automatically rewrites query
         2. Retrieves relevant chunks (with optional Hybrid Search and Flash Re-ranking)
         3. Builds adaptive prompt (with optional Multilingual target language support)
@@ -260,7 +270,7 @@ class RAGPipeline:
         ret_strat = "hybrid" if hybrid else (retrieval_strategy or self.retrieval_strategy)
         rw_info = self.rewrite_query(query)
         hits = self.retrieve(
-            query,
+            retrieval_query or query,
             top_k=top_k,
             retrieval_strategy=ret_strat,
             hybrid_alpha=hybrid_alpha,
@@ -291,6 +301,7 @@ class RAGPipeline:
                 system_prompt=chosen_sys,
                 user_template=user_template,
                 language=chosen_lang,
+                history=history,
             )
         else:
             built = prompt_mod.build(
@@ -300,6 +311,7 @@ class RAGPipeline:
                 system_prompt=chosen_sys,
                 user_template=user_template,
                 language=chosen_lang,
+                history=history,
             )
 
         answer = llm_mod.generate(
@@ -337,8 +349,16 @@ class RAGPipeline:
                 "wants_irac": rw_info.wants_irac,
                 "detected_concepts": rw_info.detected_concepts,
                 "language": chosen_lang,
+                "embed_provider": self.store.embed_provider,
+                "llm_error": getattr(answer, "error", None),
             },
         )
+
+    _FOLLOW_UP_RE = re.compile(
+        r"\b(it|its|this|that|these|those|they|them|their|he|she|his|her|also|same|above|previous|earlier|more)\b"
+        r"|^\s*(and|but|what about|how about|why|explain|elaborate)\b",
+        re.IGNORECASE,
+    )
 
     def chat(
         self,
@@ -350,30 +370,63 @@ class RAGPipeline:
         **kwargs: Any,
     ) -> RAGResponse:
         """
-        Multi-Turn Conversational Q&A.
-        Maintains conversation history and contextually grounds follow-up questions.
-        Supports Multilingual answering (`language="Hindi"`, `"Spanish"`, etc.).
-        """
-        search_query = query
-        if self.history:
-            last_user_turns = [m["content"] for m in self.history if m["role"] == "user"]
-            if last_user_turns:
-                last_user = last_user_turns[-1]
-                q_lower = query.lower()
-                # Check for pronoun or continuation follow-ups
-                if any(p in q_lower for p in (" it", " this", " that", " he", " she", " they", " its", " his", " her", " also", " what about")):
-                    search_query = f"{last_user} {query}"
+        Multi-turn conversational Q&A with memory.
 
-        res = self.ask(
-            query=search_query,
+        The last `max_history_turns` exchanges are passed to the LLM, so follow-ups like
+        "what are its exceptions?" are answered in context. Follow-ups are also retrieved
+        with the previous question attached, so "it" finds the right passages.
+        """
+        res = self.respond(
+            query,
+            history=self.history,
             top_k=top_k,
             rerank=rerank,
             hybrid=hybrid,
-            language=language or self.language,
+            language=language,
             **kwargs,
         )
         self.history.append({"role": "user", "content": query})
         self.history.append({"role": "assistant", "content": res.answer})
+        return res
+
+    def respond(
+        self,
+        query: str,
+        history: list[dict[str, str]] | None = None,
+        top_k: int = 5,
+        rerank: bool = False,
+        hybrid: bool = False,
+        language: str | None = None,
+        **kwargs: Any,
+    ) -> RAGResponse:
+        """
+        Stateless multi-turn answer: like `chat()`, but the caller owns `history`.
+
+        Safe to call from many threads at once (the UI server keeps one history per browser
+        conversation and passes it here).
+        """
+        turns = [
+            {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+            for m in (history or [])
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        window = turns[-2 * self.max_history_turns :] if self.max_history_turns > 0 else []
+        retrieval_query = query
+        prev_user = next((m["content"] for m in reversed(window) if m["role"] == "user"), None)
+        if prev_user and (len(query.split()) <= 6 or self._FOLLOW_UP_RE.search(query)):
+            retrieval_query = f"{prev_user} {query}"
+
+        res = self.ask(
+            query=query,
+            top_k=top_k,
+            rerank=rerank,
+            hybrid=hybrid,
+            language=language or self.language,
+            history=window,
+            retrieval_query=retrieval_query,
+            **kwargs,
+        )
+        res.metadata["history_turns_used"] = sum(1 for m in window if m["role"] == "user")
         return res
 
     def clear_history(self) -> None:
@@ -421,21 +474,22 @@ def _resolve_source_doc(source: str | Path | ParsedDocument, force_law: bool = F
 
 def create(
     source: str | Path | ParsedDocument,
-    chunk_strategy: str | list[str] = "recursive",
-    chunk_size: int = 800,
-    chunk_overlap: int = 120,
+    chunk_strategy: str | list[str] = "auto",
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
     overlap: int | None = None,
     combination_mode: str = "ensemble",
-    embed_provider: str = "fast_local",
+    embed_provider: str = "auto",
     embed_strategy: str = "dense",
     embed_model: str | None = None,
     embed_api_key: str | None = None,
     embed_dimension: int = 384,
     retrieval_strategy: str = "hybrid",
-    vectordb: str = "chroma",
+    vectordb: str = "memory",
     backend: str | None = None,
     collection_name: str = "ragspark_general",
     persist_directory: str | Path | None = None,
+    persist_dir: str | Path | None = None,
     prompt_technique: str = "standard",
     prompt: str | None = None,
     technique: str | None = None,
@@ -453,6 +507,7 @@ def create(
 ) -> RAGPipeline:
     """
     Create a full RAG pipeline for ANY general document, PDF, text file, or string.
+    Defaults: natural-boundary chunks, `auto` embeddings, in-memory store (pass `persist_dir` to save).
     Supports single or combined chunking strategies (`chunk_strategy=["recursive", "semantic"]`),
     customizable embedding strategies (`embed_strategy`), customizable retrieval strategies (`retrieval_strategy`),
     prompt engineering (`prompt_technique` & `system_prompt`), LLM (`llm_provider`, `llm_model`, `llm_api_key`),
@@ -467,25 +522,19 @@ def create(
     eff_overlap = overlap if overlap is not None else chunk_overlap
 
     doc = _resolve_source_doc(source, force_law=False)
-    chunks = chunker_mod.chunk(
-        doc,
-        strategy=chunk_strategy,
-        chunk_size=chunk_size,
-        chunk_overlap=eff_overlap,
-        combination_mode=combination_mode,
-    )
-    embeddings = embedder_mod.embed(
-        chunks,
-        provider=embed_provider,
-        strategy=embed_strategy,
-        model=embed_model,
-        api_key=chosen_embed_key,
-        dimension=embed_dimension,
+    chunks = chunker_mod.filter_noise(
+        chunker_mod.chunk(
+            doc,
+            strategy=chunk_strategy,
+            chunk_size=chunk_size,
+            chunk_overlap=eff_overlap,
+            combination_mode=combination_mode,
+        )
     )
     store = vectordb_mod.connect(
         provider=chosen_vdb,
         collection_name=collection_name,
-        persist_directory=persist_directory,
+        persist_directory=persist_dir if persist_dir is not None else persist_directory,
         api_key=api_key,
         embed_provider=embed_provider,
         embed_strategy=embed_strategy,
@@ -494,14 +543,14 @@ def create(
         embed_dimension=embed_dimension,
         **vectordb_kwargs,
     )
-    store.add(chunks, embeddings)
+    store.add(chunks)  # embeds with the auto ladder and pins the provider for queries
 
     return RAGPipeline(
         document=doc,
         chunks=chunks,
         store=store,
         mode="general",
-        embed_provider=embed_provider,
+        embed_provider=store.embed_provider,
         embed_strategy=embed_strategy,
         embed_model=embed_model,
         embed_api_key=chosen_embed_key,
@@ -525,16 +574,17 @@ def create_law(
     chunk_overlap: int = 100,
     overlap: int | None = None,
     combination_mode: str = "ensemble",
-    embed_provider: str = "fast_local",
+    embed_provider: str = "auto",
     embed_strategy: str = "legal_domain_boost",
     embed_model: str | None = None,
     embed_api_key: str | None = None,
     embed_dimension: int = 384,
     retrieval_strategy: str = "rerank",
-    vectordb: str = "chroma",
+    vectordb: str = "memory",
     backend: str | None = None,
     collection_name: str = "ragspark_law",
     persist_directory: str | Path | None = None,
+    persist_dir: str | Path | None = None,
     prompt_technique: str = "natural_law",
     prompt: str | None = None,
     technique: str | None = None,
@@ -555,7 +605,7 @@ def create_law(
     1. Parses with Legal Regex Intelligence (`parser.parse_law`)
     2. Chunks by statutory/contractual hierarchy (`chunk_strategy="legal_clause"` or combined `["legal_clause", "semantic"]`)
     3. Embeds with `embed_strategy="legal_domain_boost"`
-    4. Indexes into VectorDB (`vectordb="chroma"` by default) and retrieves with 2-stage legal reranking (`retrieval_strategy="rerank"`)
+    4. Indexes into VectorDB (in-memory by default; `persist_dir=` saves to SQLite) and retrieves with 2-stage legal reranking (`retrieval_strategy="rerank"`)
     5. Automatically rewrites Legal & Story Queries (`rewrite_law_query`) to map stories/scenarios to exact Articles/Sections
     6. Generates natural, fluent legal sentences by default, and switches to IRAC only when the user writes 'IRAC' in their query!
     7. Supports Multilingual answers (`language="Hindi"`, `"Spanish"`, `"French"`, `"auto"`).
@@ -579,19 +629,12 @@ def create_law(
             chunk_overlap=eff_overlap,
             combination_mode=combination_mode,
         )
+    chunks = chunker_mod.filter_noise(chunks)
 
-    embeddings = embedder_mod.embed(
-        chunks,
-        provider=embed_provider,
-        strategy=embed_strategy,
-        model=embed_model,
-        api_key=chosen_embed_key,
-        dimension=embed_dimension,
-    )
     store = vectordb_mod.connect(
         provider=chosen_vdb,
         collection_name=collection_name,
-        persist_directory=persist_directory,
+        persist_directory=persist_dir if persist_dir is not None else persist_directory,
         api_key=api_key,
         embed_provider=embed_provider,
         embed_strategy=embed_strategy,
@@ -600,14 +643,14 @@ def create_law(
         embed_dimension=embed_dimension,
         **vectordb_kwargs,
     )
-    store.add(chunks, embeddings)
+    store.add(chunks)
 
     return RAGPipeline(
         document=doc,
         chunks=chunks,
         store=store,
         mode="law",
-        embed_provider=embed_provider,
+        embed_provider=store.embed_provider,
         embed_strategy=embed_strategy,
         embed_model=embed_model,
         embed_api_key=chosen_embed_key,
@@ -631,11 +674,11 @@ def ask(
     hybrid: bool = False,
     hybrid_alpha: float = 0.65,
     rerank: bool = False,
-    chunk_strategy: str | list[str] = "recursive",
-    embed_provider: str = "fast_local",
+    chunk_strategy: str | list[str] = "auto",
+    embed_provider: str = "auto",
     embed_strategy: str = "dense",
     retrieval_strategy: str = "hybrid",
-    vectordb: str = "chroma",
+    vectordb: str = "memory",
     prompt_technique: str = "standard",
     system_prompt: str | None = None,
     llm_provider: str = "extractive",
@@ -690,10 +733,10 @@ def ask_law(
     query: str,
     top_k: int = 5,
     chunk_strategy: str | list[str] = "legal_clause",
-    embed_provider: str = "fast_local",
+    embed_provider: str = "auto",
     embed_strategy: str = "legal_domain_boost",
     retrieval_strategy: str = "rerank",
-    vectordb: str = "chroma",
+    vectordb: str = "memory",
     prompt_technique: str = "natural_law",
     system_prompt: str | None = None,
     llm_provider: str = "extractive",
@@ -726,7 +769,7 @@ def load(
     collection_name: str = "ragspark_collection",
     persist_directory: str | Path | None = None,
     mode: str = "general",
-    embed_provider: str = "fast_local",
+    embed_provider: str = "auto",
     embed_strategy: str = "dense",
     embed_model: str | None = None,
     embed_api_key: str | None = None,
@@ -746,9 +789,8 @@ def load(
     **vectordb_kwargs: Any,
 ) -> RAGPipeline:
     """
-    Instant 1-Line Pipeline Loader (`bot = rag.load()`):
-    Reloads your already-chunked & embedded VectorDB from disk (`.ragspark_store`) in <0.05s
-    so you NEVER have to re-run Document Parsing, Chunking, or Embedding cells!
+    Instant pipeline loader (`bot = rag.load(persist_dir="my_index")`):
+    reloads a collection saved with `persist_dir=` without re-parsing, re-chunking or re-embedding.
     """
     store = vectordb_mod.load(
         collection_name=collection_name,
@@ -777,9 +819,9 @@ def load(
         chunks=chunks,
         store=store,
         mode=mode,
-        embed_provider=embed_provider,
-        embed_strategy=embed_strategy,
-        embed_model=embed_model,
+        embed_provider=store.embed_provider,
+        embed_strategy=store.embed_strategy,
+        embed_model=store.embed_model,
         embed_api_key=embed_api_key or api_key,
         embed_dimension=embed_dimension,
         retrieval_strategy=retrieval_strategy,
@@ -794,6 +836,131 @@ def load(
     )
 
 
+_LLM_ENV_KEYS = {
+    "groq": "GROQ_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
+
+def _expand_sources(source: Any) -> list[str | Path | ParsedDocument]:
+    """Accept one source, a list of sources, or a directory (all supported files inside it)."""
+    items = list(source) if isinstance(source, (list, tuple)) else [source]
+    out: list[str | Path | ParsedDocument] = []
+    supported = {".pdf", ".docx", ".txt", ".md", ".markdown", ".csv", ".json", ".jsonl", ".html", ".htm"}
+    for item in items:
+        if isinstance(item, (str, Path)) and "\n" not in str(item) and len(str(item)) < 260:
+            cand = Path(item)
+            if cand.is_dir():
+                out.extend(sorted(f for f in cand.rglob("*") if f.is_file() and f.suffix.lower() in supported))
+                continue
+        out.append(item)
+    return out
+
+
+def pipeline(
+    source: str | Path | ParsedDocument | list[Any],
+    llm: str | None = None,
+    *,
+    model: str | None = None,
+    api_key: str | None = None,
+    mode: str = "general",
+    chunk_strategy: str | list[str] = "auto",
+    chunk_size: int | None = None,
+    embed_provider: str = "auto",
+    retrieval_strategy: str | None = None,
+    persist_dir: str | Path | None = None,
+    collection_name: str = "ragspark",
+    language: str | None = None,
+    system_prompt: str | None = None,
+    **kwargs: Any,
+) -> RAGPipeline:
+    """
+    The unified 3-line entry point:
+
+        import ragspark
+        bot = ragspark.pipeline("docs/", llm="groq")
+        print(bot.ask("What is the refund policy?"))
+
+    Args:
+        source: A file path, a directory (every supported file inside), raw text, a
+            `ParsedDocument`, or a list of any of these.
+        llm: `"groq"`, `"gemini"`, `"openai"`, `"anthropic"`, `"ollama"`, a model name such as
+            `"gemini 2.5 flash"`, or None for offline extractive answers. Keys are read from the
+            environment (GROQ_API_KEY, GEMINI_API_KEY, ...) unless `api_key` is passed.
+        mode: `"general"` or `"law"` (statutory hierarchy, legal reranking).
+        chunk_size: None (default) chunks by natural document boundaries.
+        persist_dir: Folder to save the index in (SQLite). Nothing is written without it.
+    """
+    is_law = mode.lower() == "law"
+    sources = _expand_sources(source)
+    if not sources:
+        raise ValueError(f"No supported documents found in {source!r}.")
+
+    docs = [_resolve_source_doc(s, force_law=is_law) for s in sources]
+    all_chunks: list[Chunk] = []
+    for doc in docs:
+        if is_law and chunk_strategy == "auto" and doc.flat_sections:
+            chunks = chunker_mod.chunk_law(doc, chunk_size=chunk_size or chunker_mod.NATURAL_CEILING, chunk_overlap=0)
+        else:
+            chunks = chunker_mod.chunk(doc, strategy=chunk_strategy, chunk_size=chunk_size)
+        all_chunks.extend(chunker_mod.filter_noise(chunks))
+
+    store = vectordb_mod.connect(
+        provider="memory",
+        collection_name=collection_name,
+        persist_dir=persist_dir,
+        embed_provider=embed_provider,
+        embed_strategy="legal_domain_boost" if is_law else "dense",
+        embed_api_key=kwargs.pop("embed_api_key", None),
+    )
+    store.add(all_chunks, auto_save=False)  # one embedding pass, one disk commit
+    store.save()
+
+    llm_provider, llm_model = "extractive", None
+    if llm or model:
+        llm_provider, llm_model = llm_mod.resolve_model_and_provider(provider=llm or "auto", model=model)
+    llm_key = api_key
+    if llm_key is None and llm_provider in _LLM_ENV_KEYS:
+        import os
+
+        llm_key = os.environ.get(_LLM_ENV_KEYS[llm_provider]) or (
+            os.environ.get("GOOGLE_API_KEY") if llm_provider == "gemini" else None
+        )
+
+    primary = docs[0]
+    if len(docs) > 1:
+        primary = ParsedDocument(
+            source=", ".join(Path(str(d.source)).name for d in docs[:5]) + (" ..." if len(docs) > 5 else ""),
+            doc_type=primary.doc_type,
+            mode_used=primary.mode_used,
+            engine_used="multi_source",
+            raw_text="",
+            text="",
+            pages=[],
+            metadata={"sources": [str(d.source) for d in docs]},
+        )
+
+    return RAGPipeline(
+        document=primary,
+        chunks=all_chunks,
+        store=store,
+        mode="law" if is_law else "general",
+        embed_provider=store.embed_provider,
+        embed_strategy=store.embed_strategy,
+        retrieval_strategy=retrieval_strategy or ("rerank" if is_law else "hybrid"),
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_api_key=llm_key,
+        prompt_technique="natural_law" if is_law else "standard",
+        system_prompt=system_prompt,
+        language=language,
+        **kwargs,
+    )
+
+
 rewrite_query = prompt_mod.rewrite_query
 rewrite_law_query = prompt_mod.rewrite_law_query
 
@@ -801,6 +968,7 @@ rewrite_law_query = prompt_mod.rewrite_law_query
 __all__ = [
     "RAGPipeline",
     "RAGResponse",
+    "pipeline",
     "create",
     "create_law",
     "load",

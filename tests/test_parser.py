@@ -90,7 +90,7 @@ def test_import_style_and_all_modules() -> None:
     assert hasattr(rag, "create")
     assert hasattr(rag, "create_law")
     assert hasattr(ui, "launch")
-    assert ragspark.__version__ == "0.3.0"
+    assert ragspark.__version__ == "0.4.0"
 
 
 def test_fast_30_page_pdf_speed_and_cleaning(tmp_path: Path) -> None:
@@ -161,7 +161,7 @@ def test_embedding_strategies_and_all_7_retrieval_techniques(tmp_path: Path) -> 
     assert "legal_clause" in store.list_indexed_strategies()
 
     q_text = "What are the obligations under Section 2 regarding cross-border data transfers?"
-    q_vec = embedder.embed_query(q_text, strategy="legal_domain_boost", dimension=256)
+    q_vec = embedder.embed_query(q_text, provider="fast_local", strategy="legal_domain_boost", dimension=256)
 
     for ret_strat in ("semantic", "bm25", "hybrid", "rrf", "mmr", "rerank", "multi_query"):
         hits = store.search(q_vec, query_text=q_text, top_k=3, strategy=ret_strat)

@@ -1,6 +1,6 @@
 # ⚡ `ragspark` — Unified One-Command Industry RAG Pipeline Library
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.3.0-blue.svg)](https://pypi.org/project/ragspark/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.4.0-blue.svg)](https://pypi.org/project/ragspark/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -21,6 +21,11 @@ To install with all vector database, OCR, and LLM backends:
 pip install "ragspark[full]"
 ```
 
+For real local semantic embeddings (quantized ONNX on CPU, no API key):
+```bash
+pip install "ragspark[onnx]"
+```
+
 ---
 
 ## 🚀 1-Minute Quickstart
@@ -28,15 +33,29 @@ pip install "ragspark[full]"
 ```python
 import ragspark
 
-# 1. Spin up an entire RAG pipeline from any PDF, Word doc, Markdown, CSV, or JSON
-bot = ragspark.rag.create("annual_report.pdf")
+bot = ragspark.pipeline("annual_report.pdf", llm="groq")   # file, folder, text, or a list of them
+print(bot.ask("What were the key drivers of Q4 revenue growth?"))
+```
 
-# 2. Ask questions with instant retrieval, re-ranking, and grounded generation
-res = bot.ask("What were the key drivers of Q4 revenue growth?")
-print(res.answer)
+`llm=` accepts `"groq"`, `"gemini"`, `"openai"`, `"anthropic"`, `"ollama"` or a model name; API keys are
+read from the environment (`GROQ_API_KEY`, `GEMINI_API_KEY`, ...). Leave it out for offline extractive answers.
+`print(res.format_citations())` shows the supporting evidence.
 
-# 3. View sentence-level verifiable evidence citations
-print(res.format_citations())
+### v0.4.0 defaults
+
+| Concern | Default behaviour |
+| :--- | :--- |
+| Chunking | `chunk_size=None` chunks by natural boundaries (Part/Article/Section headings, Markdown headings, functions/classes, tables, paragraphs). Blocks over 2,500 chars are subdivided. No strategy ever cuts a word in half. |
+| Noise | Table-of-contents and gazette boilerplate are dropped before indexing. |
+| Embeddings | `embed_provider="auto"`: local ONNX (`ragspark[onnx]`), then Gemini/OpenAI if a key is set, then pure BM25. It never crashes. `fast_local` hashing is no longer chosen automatically. |
+| Storage | In memory. Nothing is written unless you pass `persist_dir=` (SQLite, WAL, one transaction per `add()`). In-memory stores past 10,000 chunks spill to the OS temp dir. |
+| Answers | Markdown heading and bullets, with no "Based on the text..." / "According to Page 1..." filler. |
+| Chat | `bot.chat()` passes the recent turns to the LLM; `bot.respond(q, history)` is the stateless form. |
+| UI | `ui.launch(bot)` serves a ChatGPT-style page with a conversation sidebar. If the port is busy, it uses a free one. |
+
+```python
+bot = ragspark.pipeline("contracts/", persist_dir="contract_index")      # build once, saved to disk
+bot = ragspark.rag.load(persist_dir="contract_index")                    # reload later, no re-embedding
 ```
 
 ---
@@ -53,8 +72,8 @@ print(res.format_citations())
 | **Multi-Turn Chat Memory** | Stateful conversation tracking with sliding context memory | `bot.chat("What was our profit?"); bot.chat("How does that compare to 2024?")` |
 | **Sentence-Level Citations** | Fine-grained passage verification with exact page, chunk ID, and snippet | `print(res.format_citations())` |
 | **4-Layer OCR Fallback** | Native text $\to$ RapidOCR $\to$ PyTesseract $\to$ Gemini Vision AI | `parser.parse("scanned_receipt.pdf")` |
-| **Instant `<0.05s` Disk Reload** | Auto-persisted indices on disk; reload without re-parsing or re-embedding | `bot = ragspark.rag.load()` |
-| **Built-in UI Studio** | Inline Jupyter/Colab widget or full standalone Streamlit browser app | `ui.notebook_chat(bot)` or `ui.launch()` |
+| **Instant Disk Reload** | Opt-in SQLite index (`persist_dir=`); reload without re-parsing or re-embedding | `bot = ragspark.rag.load(persist_dir="idx")` |
+| **Built-in Chat UI** | ChatGPT-style page on a built-in threaded HTTP server (no Streamlit), or inline in Jupyter/Colab | `ui.launch(bot)` or `ui.notebook_chat(bot)` |
 
 ---
 
@@ -201,7 +220,7 @@ doc = parser.parse("document.pdf")
 chunks = chunker.chunk(doc, strategy="table_aware", chunk_size=500)
 
 # Step 3: Vector Storage
-db = vectordb.store(chunks, backend="chroma", collection_name="knowledge_base")
+db = vectordb.store(chunks, collection_name="knowledge_base")   # in memory; add persist_dir="kb" to save
 
 # Step 4: Hybrid Retrieval
 hits = db.hybrid_search("financial forecast", top_k=10, alpha=0.7)

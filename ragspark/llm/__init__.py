@@ -37,10 +37,10 @@ AVAILABLE_LLM_PROVIDERS = (
 
 # Friendly alias table for common human-written model names (while also passing through ANY custom/future model name!)
 FRIENDLY_MODEL_ALIASES: dict[str, str] = {
-    "gemini 3.8 flash": "gemini-2.5-flash",
-    "gemini-3.8-flash": "gemini-2.5-flash",
-    "gemini 3.8 pro": "gemini-2.5-pro",
-    "gemini-3.8-pro": "gemini-2.5-pro",
+    "gemini 3.8 flash": "gemini-3.8-flash",
+    "gemini-3.8-flash": "gemini-3.8-flash",
+    "gemini 3.8 pro": "gemini-3.8-pro",
+    "gemini-3.8-pro": "gemini-3.8-pro",
     "gemini 2.5 flash": "gemini-2.5-flash",
     "gemini 2.5 pro": "gemini-2.5-pro",
     "gemini 2.0 flash": "gemini-2.0-flash",
@@ -130,7 +130,7 @@ def resolve_model_and_provider(
     # Default model per provider if user only specified provider or left model="extractive"
     if not norm_model or (prov != "extractive" and norm_model.lower() == "extractive"):
         defaults = {
-            "gemini": "gemini-2.5-flash",
+            "gemini": "gemini-3.8-flash",
             "anthropic": "claude-3-7-sonnet-latest",
             "openai": "gpt-4o-mini",
             "groq": "llama-3.3-70b-versatile",
@@ -141,6 +141,85 @@ def resolve_model_and_provider(
         norm_model = defaults.get(prov, "llama3.2")
 
     return prov, norm_model
+
+
+_FILLER_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:sure|certainly|of course|great question)[!.,]?\s*"
+    r"|(?:based|drawing) (?:solely |only |entirely )?(?:on|upon) (?:the |this |your )?(?:provided |given |retrieved |above )?"
+    r"(?:text|context|document|documents|passages?|information|excerpts?|sources?)[^,.:]{0,60}[,.:]\s*"
+    r"|according to (?:the )?(?:provided |given |retrieved )?(?:text|context|document|documents|passages?|page \d+|chunk \d+|sources?)[^,.:]{0,60}[,.:]\s*"
+    r"|(?:the|this) (?:provided |given |retrieved )?(?:text|context|document|passage) (?:states|says|mentions|indicates|explains)(?: that)?[,:]?\s*"
+    r"|here(?:'s| is) (?:the|an|a) (?:answer|summary|response)[^:\n]{0,40}:\s*"
+    r")+",
+    re.IGNORECASE,
+)
+
+
+def clean_answer(text: str) -> str:
+    """Strip filler intros ("Based on the text...", "According to Page 1...") from an LLM answer."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        stripped = _FILLER_RE.sub("", line, count=1)
+        if stripped != line:
+            stripped = stripped.lstrip()
+            lines[i] = stripped[:1].upper() + stripped[1:] if stripped else ""
+        break
+    return "\n".join(lines).lstrip("\n")
+
+
+_REF_END_RE = re.compile(
+    r"(?:\b(?:Article|Art|Section|Sec|Clause|Part|Chapter|Rule|Schedule|No|Fig|Vol)\.?\s+[0-9IVXLCDM]+[A-Za-z]?|\b[A-Z])\.$"
+)
+_CAPS_PREFIX_RE = re.compile(r"^(?:[A-Z0-9][A-Z0-9,()'&-]*\s+){2,}(?=[A-Z][a-z])")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Sentence splitter that keeps "Article 21." / "Section 4." / initials attached to what follows."""
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", text or "")) if p.strip()]
+    merged: list[str] = []
+    for part in parts:
+        if merged and _REF_END_RE.search(merged[-1]):
+            merged[-1] = f"{merged[-1]} {part}"
+        else:
+            merged.append(part)
+    # Drop an ALL-CAPS heading run glued onto the start ("PART III FUNDAMENTAL RIGHTS Article 21. ...").
+    return [_CAPS_PREFIX_RE.sub("", s, count=1) for s in merged]
+
+
+def _is_heading_fragment(sentence: str) -> bool:
+    letters = [c for c in sentence if c.isalpha()]
+    if not letters:
+        return True
+    upper_ratio = sum(c.isupper() for c in letters) / len(letters)
+    return upper_ratio > 0.6 or bool(re.fullmatch(r"(?:Article|Section|Part|Chapter|Clause)\s+\w+\.?", sentence))
+
+
+def _topic_heading(query: str, section: str = "") -> str:
+    """A short `###` heading for an extractive answer, from the section label or the question."""
+    if section and section != "Document Provision":
+        label = section.split(" > ")[-1].strip()
+        label = re.split(r"(?<=[a-z)])\.\s", label, maxsplit=1)[0]
+        if len(label) > 70:
+            label = label[:70].rsplit(" ", 1)[0] + "..."
+        return label
+    q = re.sub(r"[?!.]+$", "", query.strip())
+    q = re.sub(
+        r"^(?:what|who|whom|which|when|where|why|how)(?:\s+(?:is|are|was|were|does|do|did|can|could|should|would|will))?\s+(?:the\s+)?",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(r"^(?:explain|describe|tell me about|summari[sz]e|define)\s+(?:the\s+)?", "", q, flags=re.IGNORECASE)
+    words = q.split()
+    if not words:
+        return "Answer"
+    heading = " ".join(words[:9])
+    return heading[0].upper() + heading[1:]
 
 
 class LLMResult(str):
@@ -315,7 +394,7 @@ def generate(
                 base_url=base_url or "http://localhost:11434",
                 temperature=temperature,
             )
-            return LLMResult(out, provider=prov, model=resolved_model)
+            return LLMResult(clean_answer(out), provider=prov, model=resolved_model)
         if prov == "gemini":
             out = _call_gemini(
                 system_prompt=sys_p,
@@ -324,7 +403,7 @@ def generate(
                 api_key=eff_key,
                 temperature=temperature,
             )
-            return LLMResult(out, provider=prov, model=resolved_model)
+            return LLMResult(clean_answer(out), provider=prov, model=resolved_model)
         if prov == "anthropic":
             out = _call_anthropic(
                 system_prompt=sys_p,
@@ -334,7 +413,7 @@ def generate(
                 base_url=base_url,
                 temperature=temperature,
             )
-            return LLMResult(out, provider=prov, model=resolved_model)
+            return LLMResult(clean_answer(out), provider=prov, model=resolved_model)
         if prov in ("openai", "groq", "openrouter"):
             default_url = (
                 "https://api.groq.com/openai/v1"
@@ -349,7 +428,7 @@ def generate(
                 base_url=base_url or default_url,
                 temperature=temperature,
             )
-            return LLMResult(out, provider=prov, model=resolved_model)
+            return LLMResult(clean_answer(out), provider=prov, model=resolved_model)
     except Exception as exc:
         if fallback_to_extractive:
             return LLMResult(
@@ -424,7 +503,7 @@ def _call_gemini(
         raise ValueError("Gemini API key missing. Pass `api_key='...'` or set GEMINI_API_KEY.")
 
     candidate_models = [model]
-    for fb in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+    for fb in ("gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
         if fb not in candidate_models:
             candidate_models.append(fb)
 
@@ -543,7 +622,7 @@ def _call_openai_compatible(
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}", "User-Agent": "ragspark/1.0"},
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
@@ -621,7 +700,7 @@ def _clean_prose_text(raw_text: str) -> str:
 
 def _select_query_relevant_sentences(prose: str, query: str, max_sents: int = 3) -> list[str]:
     """Select the sentences from a chunk's prose that have the highest lexical overlap with the user's query."""
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", prose) if s.strip()]
+    sents = [s for s in split_sentences(prose) if s and not _is_heading_fragment(s)]
     if len(sents) <= max_sents or not query.strip():
         return sents[:max_sents]
 
@@ -777,32 +856,38 @@ def _synthesize_extractive(
         )
         return "\n\n".join(paragraphs).strip()
 
-    # ─── MODE C: Default Natural Sentence & Paragraph Answer (No IRAC Headings!) ───
-    paragraphs = []
-    if primary["section"] and primary["section"] != "Document Provision":
-        paragraphs.append(
-            f"Under **`[{primary['section']}]`** *(Page {primary['page']})*, {lead_paragraph}"
-        )
-    else:
-        paragraphs.append(f"{lead_paragraph} *(Page {primary['page']})*")
-
+    # ─── MODE C: Default structured answer: heading, direct answer, supporting bullets ───
+    out_lines = [f"### {_topic_heading(query, primary['section'])}", "", lead_paragraph]
+    bullets: list[str] = []
+    labelled: set[str] = set()
+    seen_text = lead_paragraph.lower()
     for extra_item in top_items[1:]:
         extra_prose = _clean_prose_text(extra_item["body"])
-        extra_sents = " ".join(_select_query_relevant_sentences(extra_prose, query, max_sents=2)).strip()
-        if extra_sents and extra_sents.lower() not in lead_paragraph.lower():
-            if extra_item["section"] and extra_item["section"] != primary["section"]:
-                paragraphs.append(
-                    f"Furthermore, **`[{extra_item['section']}]`** *(Page {extra_item['page']})* provides that {extra_sents[0].lower() + extra_sents[1:] if len(extra_sents) > 1 and extra_sents[0].isupper() and not extra_sents.startswith(('Article', 'Section', 'Part', 'I ')) else extra_sents}"
-                )
+        for sent in _select_query_relevant_sentences(extra_prose, query, max_sents=2):
+            sent = sent.strip()
+            if len(sent) < 20 or sent.lower() in seen_text:
+                continue
+            seen_text += " " + sent.lower()
+            label = extra_item["section"].split(" > ")[-1] if extra_item["section"] != primary["section"] else ""
+            label = re.split(r"(?<=[a-z)])\.\s", label, maxsplit=1)[0] if label else ""
+            # Label a section once, and never when the sentence already starts with its reference.
+            if label and (label in labelled or sent.startswith(label.split(".")[0])):
+                label = ""
+            if label and label != "Document Provision" and len(label) <= 60:
+                labelled.add(label)
+                bullets.append(f"- **{label}:** {sent}")
             else:
-                paragraphs.append(extra_sents)
-
-    return "\n\n".join(paragraphs).strip()
+                bullets.append(f"- {sent}")
+    if bullets:
+        out_lines += ["", "**Related details**", *bullets[:5]]
+    return "\n".join(out_lines).strip()
 
 
 __all__ = [
     "LLMResult",
     "generate",
+    "clean_answer",
+    "split_sentences",
     "resolve_model_and_provider",
     "list_llm_providers",
     "AVAILABLE_LLM_PROVIDERS",

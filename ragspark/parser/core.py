@@ -66,16 +66,8 @@ class SmartParser:
             )
 
         path = Path(source)
-        if path.suffix.lower() != ".pdf" and path.exists():
-            text_content = path.read_text(encoding="utf-8", errors="ignore")
-            parsed = self.parse_text(
-                text=text_content,
-                mode=mode,
-                unwrap_lines=unwrap_lines,
-                custom_regexes=custom_regexes,
-            )
-            parsed.source = str(path)
-            return parsed
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
 
         pages_raw_data, tables_by_page, doc_meta, engine_used = extract_pdf_hybrid(
             path, extract_tables=extract_tables, ocr=ocr, api_key=api_key

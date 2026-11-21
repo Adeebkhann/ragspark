@@ -20,10 +20,23 @@ from typing import Any
 from ragspark.chunker import Chunk
 from ragspark.vectordb import SearchResult
 
+ANSWER_FORMAT_RULES = (
+    "ANSWER FORMAT RULES (mandatory):\n"
+    "1. Start directly with the answer. NEVER open with filler such as \"Based on the text\", "
+    "\"Based on the provided context\", \"According to the document\", \"According to Page 1\", "
+    "\"The context states\" or \"Sure!\".\n"
+    "2. Structure the answer in Markdown: a short `###` heading, a one- or two-sentence direct answer, "
+    "then `-` bullet points for the supporting details, conditions and exceptions.\n"
+    "3. Do not mention chunk numbers, page numbers, scores, or the words \"context\"/\"passage\" in the prose; "
+    "sources are shown to the user separately. Name a provision (e.g. Article 21, Section 4) only when it is part of the answer.\n"
+    "4. Use only facts from the retrieved context. If it does not contain the answer, say so in one sentence.\n"
+    "5. Ignore table-of-contents entries, gazette headers and page furniture in the context."
+)
+
 DEFAULT_GENERAL_SYSTEM_PROMPT = (
-    "You are an accurate, helpful AI assistant. Answer the user's question in clear, natural, well-structured "
-    "sentences strictly using the provided context. Cite the source page or section naturally inline. "
-    "Only use IRAC (Issue, Rule, Application, Conclusion) headings if the user explicitly asks for IRAC in their query."
+    "You are an accurate, helpful AI assistant that answers strictly from the retrieved context. "
+    "Only use IRAC (Issue, Rule, Application, Conclusion) headings if the user explicitly asks for IRAC.\n\n"
+    + ANSWER_FORMAT_RULES
 )
 
 DEFAULT_LAW_SYSTEM_PROMPT = (
@@ -33,13 +46,14 @@ DEFAULT_LAW_SYSTEM_PROMPT = (
     "(e.g., under [Part III > Article 21]). If the user presents a story or hypothetical scenario, directly "
     "address the characters and facts of the story and explain how the law applies to them. "
     "IMPORTANT: Do NOT use rigid IRAC (Issue, Rule, Application, Conclusion) headings unless the user explicitly "
-    "writes 'IRAC' in their question."
+    "writes 'IRAC' in their question.\n\n"
+    + ANSWER_FORMAT_RULES
 )
 
 TECHNIQUE_INSTRUCTIONS: dict[str, str] = {
     "standard": (
-        "Write a clear, natural, flowing explanation in well-crafted sentences grounded in the context, "
-        "citing `[Page Y]` or `[Section]` naturally inline."
+        "Give a `###` heading, a direct one- or two-sentence answer, then concise `-` bullet points with the "
+        "supporting details. No introductory filler."
     ),
     "natural_law": (
         "Write a fluent, authoritative legal explanation in natural sentences and paragraphs (like a Senior Counsel "
@@ -494,6 +508,35 @@ def register_template(name: str, instruction: str) -> None:
     register_technique(name, instruction)
 
 
+def filter_noise_items(items: list[Any]) -> list[Any]:
+    """Drop TOC / gazette boilerplate from retrieved items before they reach the LLM."""
+    from ragspark.chunker.natural import is_noise
+
+    def _text(it: Any) -> str:
+        if isinstance(it, SearchResult):
+            return it.chunk.text
+        return getattr(it, "text", None) or str(it)
+
+    kept = [it for it in items if not is_noise(_text(it))]
+    return kept if kept else list(items)
+
+
+def format_history(history: list[dict[str, str]] | None, max_chars_per_turn: int = 700) -> str:
+    """Render chat history as `User:` / `Assistant:` lines, trimming long turns at a word boundary."""
+    if not history:
+        return ""
+    lines: list[str] = []
+    for msg in history:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        content = re.sub(r"\s+", " ", str(msg.get("content", ""))).strip()
+        if len(content) > max_chars_per_turn:
+            cut = content.rfind(" ", 0, max_chars_per_turn)
+            content = content[: cut if cut > 0 else max_chars_per_turn] + " ..."
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 def _format_context(context_items: list[SearchResult] | list[Chunk] | list[str]) -> str:
     blocks: list[str] = []
     for idx, item in enumerate(context_items, start=1):
@@ -734,19 +777,6 @@ def _get_session_fallback_items() -> list[Any]:
     except Exception:
         pass
 
-    # If the Jupyter kernel was restarted and the user jumped straight to Step 6/7 without re-running Steps 1–5,
-    # automatically reload the most recently persisted VectorStore from `.ragspark_store` on disk!
-    try:
-        from pathlib import Path
-        from ragspark import vectordb as vdb_mod
-
-        if Path(".ragspark_store/_last_active.txt").exists():
-            disk_store = vdb_mod.load()
-            if getattr(disk_store, "_chunks", None):
-                return list(disk_store._chunks)
-    except Exception:
-        pass
-
     return list(_BUILTIN_CONSTITUTIONAL_CHUNKS)
 
 
@@ -762,6 +792,7 @@ def build(
     context: list[SearchResult] | list[Chunk] | list[str] | Any = None,
     max_chunks: int = 15,
     is_law: bool = False,
+    history: list[dict[str, str]] | None = None,
 ) -> BuiltPrompt:
     """
     Build a complete System + User prompt for any general or legal RAG task.
@@ -811,7 +842,8 @@ def build(
             f"- Output Language: {resolved_lang}"
         )
 
-    ctx_str = _format_context(resolved_ctx)
+    ctx_str = _format_context(filter_noise_items(resolved_ctx))
+    history_str = format_history(history)
 
     if user_template:
         user_p = user_template.format(
@@ -821,8 +853,14 @@ def build(
         )
     else:
         lang_tag = f" (IN {resolved_lang.upper()})" if (resolved_lang and resolved_lang.lower() != "english") else ""
+        history_block = (
+            f"### CONVERSATION HISTORY (most recent last; use it to resolve follow-up references)\n{history_str}\n\n"
+            if history_str
+            else ""
+        )
         user_p = (
             f"### RETRIEVED CONTEXT\n{ctx_str}\n\n"
+            f"{history_block}"
             f"### ANSWER STYLE & INSTRUCTIONS ({tech_key.upper()})\n{tech_instruction}\n\n"
             f"### USER QUESTION\n{resolved_query}\n"
             f"### REWRITTEN SEARCH INTENT\n{rw.rewritten}\n\n"
@@ -858,6 +896,7 @@ def build_law(
     query: str | None = None,
     context: list[SearchResult] | list[Chunk] | list[str] | None = None,
     max_chunks: int = 15,
+    history: list[dict[str, str]] | None = None,
 ) -> BuiltPrompt:
     """
     Specialized Law Prompt Builder:
@@ -877,6 +916,7 @@ def build_law(
         context=context,
         max_chunks=max_chunks,
         is_law=True,
+        history=history,
     )
 
 
@@ -894,4 +934,7 @@ __all__ = [
     "register_template",
     "DEFAULT_GENERAL_SYSTEM_PROMPT",
     "DEFAULT_LAW_SYSTEM_PROMPT",
+    "ANSWER_FORMAT_RULES",
+    "filter_noise_items",
+    "format_history",
 ]

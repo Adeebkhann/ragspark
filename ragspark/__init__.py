@@ -1,6 +1,11 @@
 """
 `ragspark` — Production Unified RAG Pipeline Library (General + Specialized Law RAG + Chatbot Studio UI).
 
+Three-line quick start:
+    import ragspark
+    bot = ragspark.pipeline("my_docs/", llm="groq")
+    print(bot.ask("What is the refund policy?"))
+
 Import any pipeline step directly:
     from ragspark import parser
     from ragspark import chunker
@@ -24,7 +29,7 @@ from ragspark.chunker import (
 from ragspark.embedder import embed, embed_query
 from ragspark.parser import ParsedDocument, parse, parse_law, parse_text, parse_unstructured
 from ragspark.prompt_eng import BuiltPrompt, detect_language
-from ragspark.rag import RAGPipeline, RAGResponse, ask, ask_law, chat
+from ragspark.rag import RAGPipeline, RAGResponse, ask, ask_law, chat, pipeline
 from ragspark.rag import create as build_rag
 from ragspark.rag import create_law as build_law_rag
 from ragspark.reranker import Reranker, rerank
@@ -32,10 +37,11 @@ from ragspark.ui import launch as launch_ui
 from ragspark.ui import notebook_chat
 from ragspark.vectordb import SearchResult, VectorStore, store
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
+    "pipeline",
     "parser",
     "chunker",
     "embedder",

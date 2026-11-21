@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ragspark"
-version = "0.3.0"
+version = "0.4.0"
 description = "Unified One-Command Industry RAG Pipeline Library with Hybrid Search, Query Rewriting, Multi-VectorDB, and Studio UI"
 readme = "README.md"
 license = { text = "MIT" }
@@ -40,11 +40,33 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+chroma = [
+    "chromadb>=0.5.0",
+]
+embeddings = [
+    "sentence-transformers>=3.0.0",
+]
+onnx = [
+    "fastembed>=0.4.0",
+]
+llm = [
+    "openai>=1.30.0",
+    "google-genai>=0.3.0",
+    "groq>=0.9.0",
+]
+ui = [
+    "ipywidgets>=8.1.0",
+]
+ocr = [
+    "rapidocr-onnxruntime>=1.3.0",
+    "pytesseract>=0.3.10",
+]
 full = [
     "chromadb>=0.5.0",
     "sentence-transformers>=3.0.0",
     "openai>=1.30.0",
     "google-genai>=0.3.0",
+    "groq>=0.9.0",
     "ipywidgets>=8.1.0",
 ]
 dev = [

@@ -1,29 +1,57 @@
 """
-`ragspark.chunker` — Production Multi-Strategy & Combination Chunker (General + Law).
+`ragspark.chunker` — Universal Domain-Aware Chunker (v0.4.0).
 
-Supports 10 Individual Strategies + Multi-Strategy Combinations:
-  - "auto"           (Picks "legal_clause" for law docs, "recursive" for general)
+Supports 24 strategies across ALL domains — auto-detected, no config needed.
+
+Invariants (every strategy):
+  - No word is ever cut in half: splits happen only at paragraph/sentence/line breaks or whitespace.
+  - When `chunk_size` is omitted (None) with `strategy="auto"`, chunks follow natural document
+    boundaries (Article/Section headings, Markdown headings, functions/classes, paragraphs).
+  - Natural blocks over 2,500 chars are subdivided; no strategy returns a runaway chunk.
+
+NATURAL STRATEGIES (v0.4.0):
+  - "natural"        (Natural boundaries: headings / code defs / tables / paragraphs, 2,500-char ceiling)
+  - "micro_sentence" (Small whole-sentence windows inside each natural block, for high-precision recall)
+
+ORIGINAL 15 STRATEGIES:
+  - "auto"           (Smart auto: detects domain, picks best strategy automatically)
   - "recursive"      (Paragraph -> Line -> Sentence -> Word recursive splitter)
   - "fixed"          (Deterministic fixed character window with overlap)
   - "sentence"       (Sentence-boundary window splitter)
   - "token"          (Word/token window splitter)
   - "paragraph"      (Paragraph-block splitter)
-  - "markdown"       (Heading-hierarchy `# / ## / ###` splitter)
+  - "markdown"       (Heading-hierarchy # / ## / ### splitter)
   - "semantic"       (CPU lexical-cohesion topic-shift splitter)
   - "sliding_window" (Dense overlapping sliding window for high-recall retrieval)
   - "parent_child"   (Hierarchical parent context stored in metadata + granular child text)
-  - "legal_clause"   (Specialized Law hierarchy: Part > Chapter > Section > Clause > Proviso + definitions)
+  - "legal_clause"   (Law: Part > Chapter > Section > Clause > Proviso + definitions)
+  - "table_aware"    (Preserves Markdown/HTML table integrity)
+  - "code_aware"     (AST/syntax-conscious code block splitter)
+  - "contextual"     (Prepends document-level contextual headers)
+  - "adaptive"       (Dynamically routes by content: code/table/markdown/prose)
 
-Combination of Strategies (for ChromaDB Experimentation):
-  - Pass a list: `chunker.chunk(doc, strategy=["recursive", "semantic", "legal_clause"])`
-  - Or `+` string: `chunker.chunk(doc, strategy="legal_clause+sliding_window")`
-  - Mode `"ensemble"` (default for lists): runs each strategy and tags each chunk's `strategy` field in ChromaDB
-    so you can compare or retrieve across combined strategies!
-  - Mode `"chain"` (or `"+"` syntax): pipelines Coarse Strategy -> Fine Strategy sequentially.
+NEW DOMAIN-SPECIFIC STRATEGIES (v0.4.0):
+  - "medical_chunk"    (Clinical sections: History/Diagnosis/Treatment/References)
+  - "finance_chunk"    (Financial tables atomic, fiscal period context attached)
+  - "research_chunk"   (Abstract > Methods > Results > Discussion, citations preserved)
+  - "news_chunk"       (Inverted pyramid: headline+lead atomic, paragraphs as chunks)
+  - "qa_chunk"         (Q&A pairs always kept together, never split)
+  - "ecommerce_chunk"  (Product title+attributes atomic, reviews separate)
+  - "policy_chunk"     (Policy ID+Scope+Statement atomic, sections separate)
+
+SMART AUTO (uses detect_domain() — zero config, works on ANY domain):
+  chunker.chunk(doc, strategy="auto")  → detects & routes automatically
+
+Combination of Strategies:
+  - Pass a list: chunker.chunk(doc, strategy=["recursive", "semantic", "legal_clause"])
+  - Or + string: chunker.chunk(doc, strategy="legal_clause+sliding_window")
+  - mode="ensemble": runs each strategy, tags chunks by strategy for A/B testing
+  - mode="chain": coarse → fine pipeline
 """
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import re
 from dataclasses import asdict, dataclass, field
@@ -31,6 +59,36 @@ from pathlib import Path
 from typing import Any
 
 from ragspark.parser import ParsedDocument, parse, parse_law, parse_text
+
+# v0.4.0: Universal domain-aware chunker — import all domain strategies + detector
+from ragspark.chunker.smart_universal import (  # noqa: E402
+    detect_domain,
+    DOMAIN_STRATEGY_MAP,
+    split_sentences_fast,
+    chunk_medical,
+    chunk_finance,
+    chunk_research,
+    chunk_news,
+    chunk_qa,
+    chunk_ecommerce,
+    chunk_policy,
+    smart_chunk,
+    ALL_STRATEGIES as _ALL_DOMAIN_STRATEGIES,
+)
+from ragspark.chunker.natural import (  # noqa: E402
+    MICRO_SENTENCE_SIZE,
+    NATURAL_CEILING,
+    _looks_like_code,
+    filter_noise,
+    is_noise,
+    micro_sentence_spans,
+    natural_spans,
+    safe_split,
+    safe_split_spans,
+)
+
+DEFAULT_CHUNK_SIZE = 800
+"""Size used by size-based strategies when `chunk_size` is omitted."""
 
 
 @dataclass
@@ -52,6 +110,8 @@ class Chunk:
 
 AVAILABLE_STRATEGIES = (
     "auto",
+    "natural",
+    "micro_sentence",
     "recursive",
     "fixed",
     "sentence",
@@ -66,6 +126,14 @@ AVAILABLE_STRATEGIES = (
     "code_aware",
     "contextual",
     "adaptive",
+    # v0.4.0 — Domain-specific strategies
+    "medical_chunk",
+    "finance_chunk",
+    "research_chunk",
+    "news_chunk",
+    "qa_chunk",
+    "ecommerce_chunk",
+    "policy_chunk",
 )
 
 
@@ -80,20 +148,8 @@ def _make_chunk_id(source: str, strategy: str, index: int, text: str) -> str:
 
 
 def _split_fixed(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= chunk_size:
-        return [text]
-    step = max(1, chunk_size - max(0, chunk_overlap))
-    out: list[str] = []
-    for i in range(0, len(text), step):
-        piece = text[i : i + chunk_size].strip()
-        if piece:
-            out.append(piece)
-        if i + chunk_size >= len(text):
-            break
-    return out
+    """Fixed-size character windows, snapped to whitespace so no word is cut."""
+    return safe_split(text, chunk_size, chunk_overlap)
 
 
 def _split_paragraph(text: str, chunk_size: int) -> list[str]:
@@ -116,52 +172,20 @@ def _split_sliding_window(text: str, chunk_size: int, stride: int | None = None)
 
 
 def _split_recursive(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
-    """Industry-standard recursive paragraph/line/sentence/word splitter."""
-    if not text.strip():
-        return []
-    text = text.strip()
-    if len(text) <= chunk_size:
-        return [text]
+    """Recursive paragraph -> sentence -> line -> word splitter (never cuts a word)."""
+    return safe_split(text, chunk_size, chunk_overlap)
 
-    paragraphs = re.split(r"\n{2,}", text)
-    chunks: list[str] = []
-    current = ""
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        if len(current) + len(para) + 2 <= chunk_size:
-            current = f"{current}\n\n{para}".strip() if current else para
-        else:
-            if current:
-                chunks.append(current)
-                overlap_tail = current[-chunk_overlap:] if chunk_overlap > 0 else ""
-                current = f"{overlap_tail}\n{para}".strip() if overlap_tail else para
-            else:
-                current = para
-
-            while len(current) > chunk_size:
-                cut = current.rfind(". ", 0, chunk_size)
-                if cut == -1 or cut < chunk_size // 2:
-                    cut = current.rfind(" ", 0, chunk_size)
-                if cut == -1 or cut < chunk_size // 3:
-                    cut = chunk_size
-                else:
-                    cut += 1
-                piece = current[:cut].strip()
-                if piece:
-                    chunks.append(piece)
-                step = max(1, cut - max(0, chunk_overlap))
-                current = current[step:].strip()
-
-    if current:
-        chunks.append(current)
-    return chunks
+def _fit(pieces: list[str], chunk_size: int) -> list[str]:
+    """Subdivide any piece longer than `chunk_size` at word-safe boundaries."""
+    out: list[str] = []
+    for p in pieces:
+        out.extend(safe_split(p, chunk_size) if len(p) > chunk_size else [p])
+    return out
 
 
 def _split_sentences(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+    sentences = _fit([s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()], chunk_size)
     if not sentences:
         return []
     chunks: list[str] = []
@@ -236,7 +260,7 @@ def _split_markdown(text: str, chunk_size: int, chunk_overlap: int) -> list[tupl
 
 def _split_semantic_cpu(text: str, chunk_size: int) -> list[str]:
     """Laptop-safe CPU Semantic Chunker splitting at lexical cohesion drops."""
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+    sentences = _fit([s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()], chunk_size)
     if not sentences:
         return []
 
@@ -397,6 +421,64 @@ def _split_adaptive(text: str, chunk_size: int, chunk_overlap: int) -> list[str]
     return _split_recursive(text, chunk_size, chunk_overlap)
 
 
+def _page_locator(doc: ParsedDocument):
+    """Return a function mapping a character offset in `doc.text` to a page number."""
+    pages = [p for p in (doc.pages or []) if (p.clean_text or "").strip()]
+    if len(pages) <= 1:
+        only = pages[0].page_number if pages else 1
+        return lambda _offset: only
+    text = doc.text or ""
+    starts: list[int] = []
+    numbers: list[int] = []
+    pos = 0
+    for page in pages:
+        probe = page.clean_text.strip()[:60]
+        found = text.find(probe, pos) if probe else -1
+        if found >= 0:
+            starts.append(found)
+            numbers.append(page.page_number)
+            pos = found + 1
+    if not starts:
+        first = pages[0].page_number
+        return lambda _offset: first
+
+    def locate(offset: int) -> int:
+        i = bisect.bisect_right(starts, offset) - 1
+        return numbers[max(0, i)]
+
+    return locate
+
+
+def _enforce_ceiling(chunks: list[Chunk], cap: int) -> list[Chunk]:
+    """Subdivide (word-safely) any chunk longer than `cap` characters."""
+    if all(len(c.text) <= cap for c in chunks):
+        return chunks
+    out: list[Chunk] = []
+    for c in chunks:
+        if len(c.text) <= cap:
+            out.append(c)
+            continue
+        parts = safe_split(c.text, cap)
+        for k, piece in enumerate(parts, start=1):
+            meta = dict(c.metadata)
+            meta.update({"part": k, "parts": len(parts), "parent_chunk_id": c.id})
+            out.append(
+                Chunk(
+                    id=f"{c.id}_p{k}",
+                    text=piece,
+                    index=c.index,
+                    source=c.source,
+                    page_number=c.page_number,
+                    section_path=c.section_path,
+                    strategy=c.strategy,
+                    metadata=meta,
+                )
+            )
+    for i, c in enumerate(out, start=1):
+        c.index = i
+    return out
+
+
 class SmartChunker:
     """Multi-Strategy & Combination Chunker for General & Legal RAG."""
 
@@ -404,8 +486,8 @@ class SmartChunker:
         self,
         doc_or_source: ParsedDocument | str | Path,
         strategy: str | list[str] = "auto",
-        chunk_size: int = 800,
-        chunk_overlap: int = 120,
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
         combination_mode: str = "ensemble",
         overlap: int | None = None,
     ) -> list[Chunk]:
@@ -415,12 +497,18 @@ class SmartChunker:
         Args:
             doc_or_source: A `ParsedDocument`, a file path (`.pdf`, `.txt`, `.md`), or a raw text string.
             strategy:
-                - Single strategy string: `"auto"`, `"recursive"`, `"fixed"`, `"sentence"`, `"token"`,
+                - `"auto"` (default): with `chunk_size=None` chunks by natural document boundaries;
+                  with a `chunk_size`, detects the domain and routes to the best strategy.
+                - `"natural"` / `"micro_sentence"`: natural blocks, or small sentence windows inside them.
+                - Single strategy string: `"recursive"`, `"fixed"`, `"sentence"`, `"token"`,
                   `"paragraph"`, `"markdown"`, `"semantic"`, `"sliding_window"`, `"parent_child"`, `"legal_clause"`
                 - Or combination list: `["legal_clause", "semantic"]`
                 - Or `+`-separated combination string: `"legal_clause+semantic"` or `"recursive+sliding_window"`
             chunk_size: Target chunk size in characters (or words when `strategy="token"`).
-            chunk_overlap: Overlap between consecutive chunks (also accepts `overlap=`).
+                `None` (default) means natural boundaries for `"auto"`/`"natural"` (2,500-char ceiling)
+                and 800 for size-based strategies.
+            chunk_overlap: Overlap between consecutive chunks (also accepts `overlap=`). Defaults to
+                `min(120, chunk_size // 5)`; natural chunks carry no overlap.
             combination_mode:
                 - `"ensemble"` (default for list): runs each strategy and merges all resulting chunks into one list
                   (with each chunk tagged by its `strategy` for ChromaDB experimentation).
@@ -429,6 +517,27 @@ class SmartChunker:
         """
         if overlap is not None:
             chunk_overlap = overlap
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        natural_mode = chunk_size is None
+        size = DEFAULT_CHUNK_SIZE if chunk_size is None else int(chunk_size)
+        if chunk_overlap is None:
+            chunk_overlap = min(120, size // 5)
+        if chunk_overlap < 0 or chunk_overlap >= size:
+            raise ValueError(f"chunk_overlap ({chunk_overlap}) must be non-negative and strictly less than chunk_size ({size}).")
+        result = self._chunk_impl(doc_or_source, strategy, chunk_size, size, chunk_overlap, combination_mode, natural_mode)
+        return _enforce_ceiling(result, max(NATURAL_CEILING, 2 * size))
+
+    def _chunk_impl(
+        self,
+        doc_or_source: ParsedDocument | str | Path,
+        strategy: str | list[str],
+        raw_chunk_size: int | None,
+        chunk_size: int,
+        chunk_overlap: int,
+        combination_mode: str,
+        natural_mode: bool,
+    ) -> list[Chunk]:
         # Handle list of strategies or "+" / ">" combined strategies
         if isinstance(strategy, (list, tuple)):
             strat_list = [str(s).strip().lower() for s in strategy if str(s).strip()]
@@ -436,7 +545,7 @@ class SmartChunker:
                 doc_or_source,
                 strategies=strat_list,
                 mode=combination_mode,
-                chunk_size=chunk_size,
+                chunk_size=raw_chunk_size,
                 chunk_overlap=chunk_overlap,
             )
 
@@ -448,7 +557,7 @@ class SmartChunker:
                 doc_or_source,
                 strategies=parts,
                 mode=mode_comb,
-                chunk_size=chunk_size,
+                chunk_size=raw_chunk_size,
                 chunk_overlap=chunk_overlap,
             )
 
@@ -458,11 +567,52 @@ class SmartChunker:
         doc = self._coerce_document(doc_or_source, force_law=(chosen_raw == "legal_clause"))
         chosen = chosen_raw
 
-        if chosen == "auto":
+        if chosen == "auto" and natural_mode:
+            # No size given: follow the document's own structure.
             if doc.mode_used == "law" and doc.flat_sections:
+                return self.chunk_law(doc, chunk_size=NATURAL_CEILING, chunk_overlap=0)
+            chosen = "natural"
+        elif chosen == "auto":
+            # v0.4.0: Universal domain detection — works for ANY domain, not just law
+            domain = detect_domain(doc.text, doc.source)
+            if domain == "law" and doc.mode_used == "law" and doc.flat_sections:
                 chosen = "legal_clause"
             else:
-                chosen = "recursive"
+                chosen = DOMAIN_STRATEGY_MAP.get(domain, "adaptive")
+
+        if chosen in ("natural", "micro_sentence"):
+            return self._chunk_natural(
+                doc,
+                micro=(chosen == "micro_sentence"),
+                chunk_size=None if natural_mode else chunk_size,
+                chunk_overlap=0 if natural_mode else chunk_overlap,
+            )
+
+        # v0.4.0: Route to new domain-specific chunkers
+        _DOMAIN_CHUNKERS = {
+            "medical_chunk":   lambda text, src: chunk_medical(text, src, chunk_size),
+            "finance_chunk":   lambda text, src: chunk_finance(text, src, chunk_size),
+            "research_chunk":  lambda text, src: chunk_research(text, src, chunk_size),
+            "news_chunk":      lambda text, src: chunk_news(text, src, chunk_size),
+            "qa_chunk":        lambda text, src: chunk_qa(text, src, chunk_size),
+            "ecommerce_chunk": lambda text, src: chunk_ecommerce(text, src, chunk_size),
+            "policy_chunk":    lambda text, src: chunk_policy(text, src, chunk_size),
+        }
+        if chosen in _DOMAIN_CHUNKERS:
+            raw_dicts = _DOMAIN_CHUNKERS[chosen](doc.text, doc.source)
+            return [
+                Chunk(
+                    id=d["id"],
+                    text=d["text"],
+                    index=d["index"],
+                    source=d["source"],
+                    page_number=d.get("page_number", 1),
+                    section_path=d.get("section_path", ""),
+                    strategy=d.get("strategy", chosen),
+                    metadata=d.get("metadata", {}),
+                )
+                for d in raw_dicts
+            ]
 
         if chosen == "legal_clause":
             return self.chunk_law(doc, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
@@ -552,8 +702,8 @@ class SmartChunker:
         doc_or_source: ParsedDocument | str | Path,
         strategies: list[str],
         mode: str = "ensemble",
-        chunk_size: int = 800,
-        chunk_overlap: int = 120,
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
     ) -> list[Chunk]:
         """
         Combine multiple chunking strategies for ChromaDB experimentation:
@@ -570,6 +720,10 @@ class SmartChunker:
 
         needs_law = "legal_clause" in clean_strats
         doc = self._coerce_document(doc_or_source, force_law=needs_law)
+        raw_size = chunk_size
+        chunk_size = DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
+        if chunk_overlap is None:
+            chunk_overlap = min(120, chunk_size // 5)
 
         if mode.lower() == "chain":
             coarse_chunks = self.chunk(
@@ -621,7 +775,7 @@ class SmartChunker:
             return macro_chunks + micro_chunks
 
         if mode.lower() == "interleave":
-            groups = [self.chunk(doc, strategy=s, chunk_size=chunk_size, chunk_overlap=chunk_overlap) for s in clean_strats]
+            groups = [self.chunk(doc, strategy=s, chunk_size=raw_size, chunk_overlap=chunk_overlap) for s in clean_strats]
             interleaved: list[Chunk] = []
             max_len = max(len(g) for g in groups) if groups else 0
             seen_texts_i: set[tuple[int, str]] = set()
@@ -639,7 +793,7 @@ class SmartChunker:
         combined: list[Chunk] = []
         seen_texts: set[tuple[int, str]] = set()
         for strat in clean_strats:
-            sub_chunks = self.chunk(doc, strategy=strat, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            sub_chunks = self.chunk(doc, strategy=strat, chunk_size=raw_size, chunk_overlap=chunk_overlap)
             for sc in sub_chunks:
                 dedup_key = (sc.page_number, sc.text.strip())
                 if dedup_key in seen_texts:
@@ -648,6 +802,70 @@ class SmartChunker:
                 sc.metadata["ensemble_strategies"] = clean_strats
                 combined.append(sc)
         return combined
+
+    def _chunk_natural(
+        self,
+        doc: ParsedDocument,
+        micro: bool = False,
+        chunk_size: int | None = None,
+        chunk_overlap: int = 0,
+    ) -> list[Chunk]:
+        """Natural-boundary chunks (or `micro_sentence` windows inside them), with TOC/gazette noise removed."""
+        text = doc.text or ""
+        if doc.raw_text and _looks_like_code(doc.raw_text):
+            text = doc.raw_text  # the cleaner flattens indentation; code needs it intact
+        is_law = doc.mode_used == "law" or str(doc.doc_type).startswith("law")
+        blocks = natural_spans(text, chunk_size=chunk_size, overlap=chunk_overlap, is_law=is_law)
+        page_of = _page_locator(doc)
+        chunks: list[Chunk] = []
+        nat_idx = 0
+        for blk in blocks:
+            block_text = text[blk.start:blk.end].strip()
+            if not block_text or is_noise(block_text):
+                continue
+            nat_idx += 1
+            parent_id = _make_chunk_id(doc.source, "natural", nat_idx, block_text)
+            base_meta = {"doc_type": doc.doc_type, "block_type": blk.kind, **blk.metadata}
+            if blk.heading:
+                base_meta["heading"] = blk.heading
+            if not micro:
+                chunks.append(
+                    Chunk(
+                        id=parent_id,
+                        text=block_text,
+                        index=nat_idx,
+                        source=doc.source,
+                        page_number=page_of(blk.start),
+                        section_path=blk.section_path,
+                        strategy="natural",
+                        metadata={**base_meta, "page": page_of(blk.start), "strategy": "natural"},
+                    )
+                )
+                continue
+            micro_size = chunk_size or MICRO_SENTENCE_SIZE
+            for a, b in micro_sentence_spans(text, blk.start, blk.end, size=micro_size):
+                piece = text[a:b].strip()
+                if not piece:
+                    continue
+                idx = len(chunks) + 1
+                chunks.append(
+                    Chunk(
+                        id=_make_chunk_id(doc.source, "micro_sentence", idx, piece),
+                        text=piece,
+                        index=idx,
+                        source=doc.source,
+                        page_number=page_of(a),
+                        section_path=blk.section_path,
+                        strategy="micro_sentence",
+                        metadata={
+                            **base_meta,
+                            "page": page_of(a),
+                            "strategy": "micro_sentence",
+                            "parent_id": parent_id,
+                        },
+                    )
+                )
+        return chunks
 
     def chunk_law(
         self,
@@ -803,12 +1021,16 @@ _LAST_ACTIVE_CHUNKS: list[Chunk] = []
 def chunk(
     doc_or_source: ParsedDocument | str | Path,
     strategy: str | list[str] = "auto",
-    chunk_size: int = 800,
-    chunk_overlap: int = 120,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
     combination_mode: str = "ensemble",
     overlap: int | None = None,
 ) -> list[Chunk]:
-    """One-command chunker supporting single strategies OR combinations (`['legal_clause', 'semantic']` or `'recursive+sentence'`)."""
+    """
+    One-command chunker supporting single strategies OR combinations (`['natural', 'micro_sentence']`).
+
+    With `chunk_size` omitted, `strategy="auto"` chunks by natural document boundaries.
+    """
     global _LAST_ACTIVE_CHUNKS
     res = default_chunker.chunk(
         doc_or_source=doc_or_source,
@@ -826,8 +1048,8 @@ def chunk_combination(
     doc_or_source: ParsedDocument | str | Path,
     strategies: list[str],
     mode: str = "ensemble",
-    chunk_size: int = 800,
-    chunk_overlap: int = 120,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
     overlap: int | None = None,
 ) -> list[Chunk]:
     """Explicitly combine multiple chunking strategies ('ensemble' or 'chain') for ChromaDB experimentation."""
@@ -874,5 +1096,22 @@ __all__ = [
     "chunk_law",
     "list_strategies",
     "AVAILABLE_STRATEGIES",
+    "DEFAULT_CHUNK_SIZE",
+    "NATURAL_CEILING",
+    "safe_split",
+    "filter_noise",
+    "is_noise",
+    # v0.4.0 — Universal domain-aware chunker
+    "detect_domain",
+    "DOMAIN_STRATEGY_MAP",
+    "split_sentences_fast",
+    "smart_chunk",
+    "chunk_medical",
+    "chunk_finance",
+    "chunk_research",
+    "chunk_news",
+    "chunk_qa",
+    "chunk_ecommerce",
+    "chunk_policy",
 ]
 
